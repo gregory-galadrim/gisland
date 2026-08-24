@@ -1,8 +1,6 @@
-/build/
-/compile_commands.json
-/.cache/
-/.clangd/
-__pycache__/
+/target/
+/.direnv/
+/.pi-cyber/
 .DS_Store
 *.swp
 *~

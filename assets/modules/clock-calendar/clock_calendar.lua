@@ -1,260 +1,92 @@
-local GLib = require("lgi").GLib
-
-local calendar = {}
-
-local function integer(value)
-  return math.tointeger(value) or math.floor(value)
-end
-
-function calendar.next_minute_delay_ms(now)
-  local elapsed = integer(now:get_second()) * 1000 + integer(now:get_microsecond() / 1000)
-  return 60000 - elapsed
-end
-
-function calendar.is_leap_year(year)
-  return year % 4 == 0 and (year % 100 ~= 0 or year % 400 == 0)
-end
-
-function calendar.days_in_month(year, month)
-  if month == 2 then
-    return calendar.is_leap_year(year) and 29 or 28
-  end
-  if month == 4 or month == 6 or month == 9 or month == 11 then
-    return 30
-  end
+local platform = require("platform")
+local defaults = { locale = nil, timezone = nil, week_start = "monday" }
+local weekday_names = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" }
+local function leap(year) return year % 4 == 0 and (year % 100 ~= 0 or year % 400 == 0) end
+local function days_in_month(year, month)
+  if month == 2 then return leap(year) and 29 or 28 end
+  if month == 4 or month == 6 or month == 9 or month == 11 then return 30 end
   return 31
 end
-
-function calendar.civil_to_ordinal(year, month, day)
-  local adjusted_year = month <= 2 and year - 1 or year
-  local era = adjusted_year // 400
-  local year_of_era = adjusted_year - era * 400
-  local shifted_month = month + (month > 2 and -3 or 9)
-  local day_of_year = (153 * shifted_month + 2) // 5 + day - 1
-  local day_of_era = year_of_era * 365 + year_of_era // 4 - year_of_era // 100 + day_of_year
-  return era * 146097 + day_of_era - 719468
+local function ordinal(year, month, day)
+  local adjusted = month <= 2 and year - 1 or year
+  local era = math.floor(adjusted / 400)
+  local yoe = adjusted - era * 400
+  local shifted = month + (month > 2 and -3 or 9)
+  local doy = math.floor((153 * shifted + 2) / 5) + day - 1
+  return era * 146097 + yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy - 719468
+end
+local function civil(value)
+  local shifted = value + 719468
+  local era = math.floor(shifted / 146097)
+  local doe = shifted - era * 146097
+  local yoe = math.floor((doe - math.floor(doe / 1460) + math.floor(doe / 36524) - math.floor(doe / 146096)) / 365)
+  local year = yoe + era * 400
+  local doy = doe - (365 * yoe + math.floor(yoe / 4) - math.floor(yoe / 100))
+  local month0 = math.floor((5 * doy + 2) / 153)
+  local day = doy - math.floor((153 * month0 + 2) / 5) + 1
+  local month = month0 + (month0 < 10 and 3 or -9)
+  return year + (month <= 2 and 1 or 0), month, day
 end
 
-function calendar.ordinal_to_civil(ordinal)
-  local shifted = ordinal + 719468
-  local era = shifted // 146097
-  local day_of_era = shifted - era * 146097
-  local year_of_era = (day_of_era - day_of_era // 1460 + day_of_era // 36524 -
-    day_of_era // 146096) // 365
-  local year = year_of_era + era * 400
-  local day_of_year = day_of_era -
-    (365 * year_of_era + year_of_era // 4 - year_of_era // 100)
-  local shifted_month = (5 * day_of_year + 2) // 153
-  local day = day_of_year - (153 * shifted_month + 2) // 5 + 1
-  local month = shifted_month + (shifted_month < 10 and 3 or -9)
-  year = year + (month <= 2 and 1 or 0)
-  return year, month, day
-end
-
-function calendar.weekday(year, month, day)
-  return (calendar.civil_to_ordinal(year, month, day) + 4) % 7
-end
-
-function calendar.shift_month(year, month, delta)
-  local index = (year * 12) + (month - 1) + delta
-  local shifted_year = math.floor(index / 12)
-  local shifted_month = (index % 12) + 1
-  if shifted_year < 1 or shifted_year > 9999 then
-    return nil
-  end
-  return shifted_year, shifted_month
-end
-
-function calendar.snapshot(GLib, zone, now, displayed_year, displayed_month, week_start)
-  local weekdays = {}
-  local weeks = {}
-  local calendar_columns = {}
-  local label_start = calendar.civil_to_ordinal(2024, 1, week_start == "sunday" and 7 or 1)
-  for index = 0, 6 do
-    local year, month, day = calendar.ordinal_to_civil(label_start + index)
-    local label_date = assert(GLib.DateTime.new(zone, year, month, day, 12, 0, 0))
-    weekdays[#weekdays + 1] = label_date:format("%a")
-  end
-
-  local first = assert(GLib.DateTime.new(zone, displayed_year, displayed_month, 1, 12, 0, 0))
-  local weekday = calendar.weekday(displayed_year, displayed_month, 1)
-  local offset = week_start == "monday" and (weekday + 6) % 7 or weekday
-  local grid_start = calendar.civil_to_ordinal(displayed_year, displayed_month, 1) - offset
-  local current_year = integer(now:get_year())
-  local current_month = integer(now:get_month())
-  local current_day = integer(now:get_day_of_month())
-
-  for week_index = 0, 5 do
-    local week = {}
+return function(api, supplied)
+  local options = platform.copy_options(defaults, supplied, "clock-calendar")
+  if options.week_start ~= "monday" and options.week_start ~= "sunday" then error("week_start must be monday or sunday") end
+  local displayed_year, displayed_month, follows, stopped = nil, nil, true, false
+  local function now() return api.time.now { timezone = options.timezone, locale = options.locale } end
+  local function publish(transitions)
+    local current = now()
+    if follows or displayed_year == nil then displayed_year, displayed_month = current.year, current.month end
+    local weekday = (ordinal(displayed_year, displayed_month, 1) + 4) % 7
+    local offset = options.week_start == "monday" and (weekday + 6) % 7 or weekday
+    local start = ordinal(displayed_year, displayed_month, 1) - offset
+    local columns = {}
     for day_index = 0, 6 do
-      local year, month, day =
-        calendar.ordinal_to_civil(grid_start + (week_index * 7) + day_index)
-      local in_month = year == displayed_year and month == displayed_month
-      local role = "muted"
-      if in_month and year == current_year and month == current_month and day == current_day then
-        role = "accent"
-      elseif in_month then
-        role = "body"
+      local children = { api.ui.text { value = weekday_names[(day_index + (options.week_start == "sunday" and 1 or 2)) % 7 + 1], role = "caption" } }
+      for week = 0, 5 do
+        local year, month, day = civil(start + week * 7 + day_index)
+        local role = month == displayed_month and year == displayed_year and "body" or "muted"
+        if year == current.year and month == current.month and day == current.day then role = "accent" end
+        children[#children + 1] = api.ui.text { value = string.format("%02d", day), role = role }
       end
-      week[#week + 1] = { label = string.format("%02d", day), role = role }
+      columns[#columns + 1] = api.ui.column { gap = "small", children = children }
     end
-    weeks[#weeks + 1] = week
+    local expanded = api.ui.column { gap = "small", children = {
+      api.ui.row { gap = "small", children = {
+        api.ui.button { action_id = "previous-month", accessible_label = "Previous month", content = api.ui.icon { name = "chevron-left" } },
+        api.ui.spacer { flexible = true },
+        api.ui.column { gap = "xsmall", children = {
+          api.ui.text { value = api.time.format({ year = displayed_year, month = displayed_month, day = 1, source = current }, "%B") .. " " .. tostring(displayed_year), role = "title" },
+          api.ui.button { action_id = "today", accessible_label = "Today", content = api.ui.text { value = "Today", role = "button" } },
+        } },
+        api.ui.spacer { flexible = true },
+        api.ui.button { action_id = "next-month", accessible_label = "Next month", content = api.ui.icon { name = "chevron-right" } },
+      } },
+      api.ui.row { gap = "small", children = columns },
+    } }
+    local spec = { context_id = "clock", priority = 10, views = {
+      compact = api.ui.row { gap = "small", children = {
+        api.ui.text { value = api.time.format(current, "%H:%M"), role = "compact-primary" },
+        api.ui.spacer { flexible = true }, api.ui.text { value = api.time.format(current, "%a %d %b"), role = "compact-secondary" },
+      } }, expanded = expanded } }
+    if transitions then spec.transitions = transitions end
+    api.publish(spec)
   end
-
-  for day_index = 1, 7 do
-    local days = {}
-    for week_index = 1, 6 do
-      days[#days + 1] = weeks[week_index][day_index]
-    end
-    calendar_columns[#calendar_columns + 1] = {
-      weekday = weekdays[day_index],
-      days = days,
-    }
+  local function schedule()
+    if stopped then return end
+    local current = now()
+    api.timer.after(60000 - current.second * 1000 - (current.millisecond or 0), function() publish() schedule() end)
   end
-
-  return {
-    time = now:format("%H:%M"),
-    date_short = now:format("%a") .. " " .. tostring(current_day) .. " " .. now:format("%b"),
-    month_label = first:format("%B") .. " " .. tostring(displayed_year),
-    weekdays = weekdays,
-    weeks = weeks,
-    calendar_columns = calendar_columns,
-  }
-end
-
-if os.getenv("GISLAND_CLOCK_CALENDAR_HELPER_TEST") == "1" then
-  return calendar
-end
-
-local zone
-local week_start = "monday"
-local displayed_year
-local displayed_month
-local follows_current_month = true
-local content_transitions = false
-local test_now_file = os.getenv("GISLAND_CLOCK_CALENDAR_TEST_NOW_FILE")
-
-local function current_time()
-  if test_now_file == nil then
-    return assert(GLib.DateTime.new_now(zone))
+  local function shift(delta)
+    local current = now()
+    if follows or displayed_year == nil then displayed_year, displayed_month = current.year, current.month end
+    local index = displayed_year * 12 + displayed_month - 1 + delta
+    local year, month = math.floor(index / 12), index % 12 + 1
+    if year < 1 or year > 9999 then return false end
+    displayed_year, displayed_month, follows = year, month, false
+    api.timer.defer(function() publish(delta > 0 and { expanded = "slide-left" } or { expanded = "slide-right" }) end)
+    return true
   end
-  local stream = assert(io.open(test_now_file, "r"))
-  local value = stream:read("*a")
-  stream:close()
-  local seconds = tonumber(value)
-  if seconds == nil or math.type(seconds) ~= "integer" then
-    error("invalid injected clock fixture")
-  end
-  return assert(GLib.DateTime.new_from_unix_utc(seconds):to_timezone(zone))
+  return { start = function() publish() schedule() end, stop = function() stopped = true end,
+    actions = { ["previous-month"] = function() return shift(-1) end, ["next-month"] = function() return shift(1) end,
+      today = function() local current = now() displayed_year, displayed_month, follows = current.year, current.month, true api.timer.defer(publish) return true end } }
 end
-
-local function synchronize_displayed_month(now)
-  if follows_current_month then
-    displayed_year = math.tointeger(now:get_year())
-    displayed_month = math.tointeger(now:get_month())
-  end
-end
-
-local function snapshot()
-  local now = current_time()
-  synchronize_displayed_month(now)
-  return calendar.snapshot(GLib, zone, now, displayed_year, displayed_month, week_start)
-end
-
-local function publish(transitions)
-  if transitions == nil then
-    gisland.data(snapshot())
-  else
-    gisland.data(snapshot(), transitions)
-  end
-end
-
-local function schedule_next_minute()
-  local delay = calendar.next_minute_delay_ms(current_time())
-  gisland.after(tostring(delay) .. "ms", function()
-    publish()
-    schedule_next_minute()
-  end)
-end
-
-local function navigate(delta)
-  local now = current_time()
-  synchronize_displayed_month(now)
-  local year, month = calendar.shift_month(displayed_year, displayed_month, delta)
-  if year == nil then
-    return false
-  end
-  displayed_year = year
-  displayed_month = month
-  follows_current_month = false
-  local transition = delta > 0 and "slide-left" or "slide-right"
-  gisland.defer(function()
-    publish(content_transitions and { expanded = transition } or nil)
-  end)
-  return true
-end
-
-local function today()
-  local now = current_time()
-  displayed_year = math.tointeger(now:get_year())
-  displayed_month = math.tointeger(now:get_month())
-  follows_current_month = true
-  gisland.defer(publish)
-  return true
-end
-
-return gisland.module {
-  init = function(config, metadata)
-    for name in pairs(config) do
-      if name ~= "locale" and name ~= "timezone" and name ~= "week_start" then
-        error("unknown clock-calendar option: " .. name)
-      end
-    end
-    local locale = config.locale or metadata.locale
-    local timezone_name = config.timezone or metadata.timezone
-    for _, capability in ipairs(metadata.capabilities) do
-      if capability == "content-transitions" then
-        content_transitions = true
-      end
-    end
-    week_start = config.week_start or "monday"
-    if locale == "" then
-      error("locale must not be empty")
-    end
-    if timezone_name == "" then
-      error("timezone must not be empty")
-    end
-    if week_start ~= "monday" and week_start ~= "sunday" then
-      error("week_start must be monday or sunday")
-    end
-    if os.setlocale(locale, "time") == nil then
-      error("invalid locale: " .. locale)
-    end
-    zone = GLib.TimeZone.new_identifier(timezone_name)
-    if zone == nil then
-      error("invalid timezone: " .. timezone_name)
-    end
-    local now = current_time()
-    displayed_year = math.tointeger(now:get_year())
-    displayed_month = math.tointeger(now:get_month())
-    publish()
-    schedule_next_minute()
-  end,
-  actions = {
-    ["previous-month"] = function()
-      return navigate(-1)
-    end,
-    ["next-month"] = function()
-      return navigate(1)
-    end,
-    ["today"] = today,
-  },
-  fallback_action = function()
-    return false
-  end,
-  visibility = function()
-    if test_now_file ~= nil then
-      publish()
-    end
-  end,
-}

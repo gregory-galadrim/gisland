@@ -1,2 +1,0 @@
-gisland.module {}
-return {}

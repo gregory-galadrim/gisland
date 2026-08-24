@@ -1,0 +1,13 @@
+[Unit]
+Description=gisland X11 overlay
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/gisland
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=default.target

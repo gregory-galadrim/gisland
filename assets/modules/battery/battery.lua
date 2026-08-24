@@ -1,535 +1,216 @@
-local lgi = require("lgi")
-local Gio = lgi.Gio
-local GLib = lgi.GLib
-local GioUnix = lgi.require("GioUnix", "2.0")
-local Json = lgi.require("Json", "1.0")
-
-local MAX_STATE_FILE_BYTES = 4096
-
-local options = {
-  warning_percent = 20,
-  persistent_percent = 10,
-  critical_percent = 5,
-  yellow_percent = 30,
-  red_percent = 15,
-  preview_duration_ms = 3000,
-}
-local emitted = {}
-local previous_on_battery
-local last_snapshot
-local last_publish = 0
-local active_alert
-local root_proxy
-local device_proxy
-local stopped = false
-
-local function round_half_even(value)
-  local lower = math.floor(value)
-  local fraction = value - lower
-  if fraction < 0.5 then
-    return lower
-  end
-  if fraction > 0.5 then
-    return lower + 1
-  end
-  return lower % 2 == 0 and lower or lower + 1
-end
-
-local function duration(seconds)
-  if seconds <= 0 then
-    return nil
-  end
-  local minutes = (seconds + 30) // 60
-  local hours = minutes // 60
-  local remainder = minutes % 60
-  if hours > 0 then
-    return string.format("%d h %02d", hours, remainder)
-  end
-  return tostring(remainder) .. " min"
-end
-
-local function snapshot_for(reading)
-  local percentage = math.max(0.0, math.min(reading.percentage, 100.0))
-  local semantic_state
-  if percentage > options.yellow_percent then
-    semantic_state = "success"
-  elseif percentage > options.red_percent then
-    semantic_state = "warning"
-  else
-    semantic_state = "error"
-  end
-  local estimate = duration(reading.on_battery and reading.time_to_empty or reading.time_to_full)
-  local state_text
-  if reading.state == "charging" then
-    state_text = "Charge"
-  elseif reading.state == "fully-charged" then
-    state_text = "Chargée"
-  elseif reading.on_battery then
-    state_text = "Décharge"
-  else
-    state_text = "Secteur"
-  end
-  local compact_estimate
-  local detail_estimate
-  if estimate == nil then
-    compact_estimate = "Calcul…"
-    detail_estimate = "—"
-  elseif reading.on_battery then
-    compact_estimate = estimate
-    detail_estimate = estimate .. " restantes"
-  else
-    compact_estimate = estimate
-    detail_estimate = estimate .. " avant charge complète"
-  end
-  local health = "—"
-  if reading.energy_full > 0.0 and reading.energy_full_design > 0.0 then
-    health = tostring(round_half_even(reading.energy_full / reading.energy_full_design * 100.0)) ..
-      " %"
-  end
-  local power = "—"
-  if reading.energy_rate > 0.0 then
-    power = string.format("%.1f W", reading.energy_rate):gsub("%.", ",")
-  end
-  return {
-    level = round_half_even(percentage / 100.0 * 10000.0) / 10000.0,
-    percent_text = tostring(round_half_even(percentage)) .. " %",
-    semantic_state = semantic_state,
-    estimate_compact = compact_estimate,
-    state_text = state_text,
-    estimate_detail = detail_estimate,
-    health_text = health,
-    power_text = power,
-  }
-end
-
-local function compact_view(snapshot)
-  return {
-    type = "row",
-    gap = "small",
-    children = {
-      {
-        type = "progress",
-        shape = "ring",
-        value = snapshot.level,
-        state = snapshot.semantic_state,
-      },
-      { type = "text", value = snapshot.percent_text, role = "compact-primary" },
-      { type = "spacer", flexible = true },
-      { type = "text", value = snapshot.estimate_compact, role = "compact-secondary" },
-    },
-  }
-end
-
-local function detail_row(label, value)
-  return {
-    type = "row",
-    gap = "small",
-    children = {
-      { type = "text", value = label, role = "caption" },
-      { type = "spacer", flexible = true },
-      { type = "text", value = value, role = "body" },
-    },
-  }
-end
-
-local function expanded_view(snapshot, dismissible)
-  local children = {
-    {
-      type = "row",
-      gap = "normal",
-      children = {
-        {
-          type = "progress",
-          shape = "ring",
-          value = snapshot.level,
-          state = snapshot.semantic_state,
-        },
-        { type = "text", value = snapshot.percent_text, role = "title" },
-        { type = "spacer", flexible = true },
-        { type = "text", value = snapshot.state_text, role = "body" },
-      },
-    },
-    detail_row("Autonomie", snapshot.estimate_detail),
-    detail_row("Santé", snapshot.health_text),
-    detail_row("Puissance", snapshot.power_text),
-  }
-  if dismissible then
-    children[#children + 1] = {
-      type = "button",
-      action_id = "dismiss-alert",
-      accessible_label = "Dismiss battery alert",
-      content = { type = "text", value = "Dismiss", role = "button" },
-    }
-  end
-  return { type = "column", gap = "normal", children = children }
-end
-
-local function state_path()
-  local root = os.getenv("XDG_STATE_HOME")
-  if root == nil or root == "" then
-    root = assert(os.getenv("HOME"), "HOME is not set") .. "/.local/state"
-  end
-  return root .. "/gisland/battery-cycle.json"
-end
-
-local function read_state_file(path)
-  -- Linux open flags: O_NONBLOCK prevents special files from stalling startup,
-  -- while O_NOFOLLOW keeps the validation and bounded read on one object.
-  local flags = 0x800 + 0x20000 + 0x80000
-  local fd = math.tointeger(GLib.open(path, flags, 0))
-  assert(fd ~= nil and fd >= 0, "cannot open battery state")
-  local stream
-  local ok, result = pcall(function()
-    local file = Gio.File.new_for_path("/proc/self/fd/" .. fd)
-    local info = assert(file:query_info(
-      "standard::type,standard::size", Gio.FileQueryInfoFlags.NONE, nil))
-    assert(tostring(info:get_file_type()) == "REGULAR", "battery state is not a regular file")
-    local size = math.tointeger(info:get_size())
-    assert(size ~= nil and size >= 0 and size <= MAX_STATE_FILE_BYTES,
-      "battery state exceeds the byte limit")
-
-    stream = assert(GioUnix.InputStream.new(fd, true))
-    fd = nil
-    local contents = assert(stream:read_bytes(MAX_STATE_FILE_BYTES + 1, nil)):get_data()
-    assert(#contents <= MAX_STATE_FILE_BYTES, "battery state changed while reading")
-    return contents
-  end)
-  if stream ~= nil then
-    pcall(function() stream:close(nil) end)
-  elseif fd ~= nil then
-    GLib.close(fd)
-  end
-  if not ok then error(result, 0) end
-  return result
-end
-
-local function load_state()
-  emitted = {}
-  previous_on_battery = nil
-  local ok, loaded_emitted, loaded_previous = pcall(function()
-    local value = read_state_file(state_path())
-    local parser = Json.Parser.new()
-    assert(parser:load_from_data(value, -1), "invalid JSON")
-    local root = parser:get_root()
-    assert(tostring(root:get_node_type()) == "OBJECT", "state root must be an object")
-    local object = root:get_object()
-    assert(object:get_size() == 3, "state must contain exactly three members")
-
-    local version = object:get_member("version")
-    local emitted_node = object:get_member("emitted")
-    local previous = object:get_member("previous_on_battery")
-    assert(version ~= nil and emitted_node ~= nil and previous ~= nil, "state member is missing")
-    assert(
-      tostring(version:get_node_type()) == "VALUE" and
-        tostring(version:get_value_type()) == "gint64" and version:get_int() == 1,
-      "unsupported state version"
-    )
-    assert(tostring(emitted_node:get_node_type()) == "ARRAY", "emitted must be an array")
-
-    local expected = {
-      [options.warning_percent] = true,
-      [options.persistent_percent] = true,
-      [options.critical_percent] = true,
-    }
-    local parsed_emitted = {}
-    local array = emitted_node:get_array()
-    for index = 0, array:get_length() - 1 do
-      local item = array:get_element(index)
-      assert(
-        tostring(item:get_node_type()) == "VALUE" and tostring(item:get_value_type()) == "gint64",
-        "emitted threshold must be an integer"
-      )
-      local threshold = math.tointeger(item:get_int())
-      assert(expected[threshold], "emitted threshold is not configured")
-      parsed_emitted[threshold] = true
-    end
-
-    local parsed_previous
-    if tostring(previous:get_node_type()) == "NULL" then
-      parsed_previous = nil
-    else
-      assert(
-        tostring(previous:get_node_type()) == "VALUE" and
-          tostring(previous:get_value_type()) == "gboolean",
-        "previous_on_battery must be boolean or null"
-      )
-      parsed_previous = previous:get_boolean()
-    end
-    return parsed_emitted, parsed_previous
-  end)
-  if ok then
-    emitted = loaded_emitted
-    previous_on_battery = loaded_previous
-  elseif Gio.File.new_for_path(state_path()):query_exists(nil) then
-    gisland.log("error", "gisland-battery: cannot load battery state: " .. tostring(loaded_emitted))
-  end
-end
-
-local function save_state()
-  local path = state_path()
-  local directory = path:match("^(.*)/[^/]+$")
-  assert(GLib.mkdir_with_parents(directory, tonumber("700", 8)) == 0, "cannot create battery state directory")
-  local thresholds = {}
-  for threshold in pairs(emitted) do
-    thresholds[#thresholds + 1] = threshold
-  end
-  table.sort(thresholds)
-  local builder = Json.Builder.new()
-  builder:begin_object()
-  builder:set_member_name("version")
-  builder:add_int_value(1)
-  builder:set_member_name("emitted")
-  builder:begin_array()
-  for _, threshold in ipairs(thresholds) do
-    builder:add_int_value(threshold)
-  end
-  builder:end_array()
-  builder:set_member_name("previous_on_battery")
-  if previous_on_battery == nil then
-    builder:add_null_value()
-  else
-    builder:add_boolean_value(previous_on_battery)
-  end
-  builder:end_object()
-
-  local generator = Json.Generator.new()
-  generator:set_root(builder:get_root())
-  local contents = generator:to_data() .. "\n"
-  local flags = GLib.FileSetContentsFlags.CONSISTENT + GLib.FileSetContentsFlags.DURABLE
-  local saved, message = GLib.file_set_contents_full(path, contents, flags, tonumber("600", 8))
-  assert(saved, tostring(message))
-  assert(GLib.chmod(path, tonumber("600", 8)) == 0, "cannot set battery state permissions")
-end
-
-local function publish_alert(kind, snapshot)
-  if active_alert ~= nil then
-    gisland.dismiss(active_alert)
-  end
-  local context_id = "battery-" .. kind
-  local persistent = kind == "persistent" or kind == "critical"
-  local priority = ({
-    plugged = 35,
-    unplugged = 35,
-    warning = 40,
-    persistent = 60,
-    critical = 90,
-  })[kind]
-  local record = {
-    context_id = context_id,
-    priority = priority,
-    views = {
-      compact = compact_view(snapshot),
-      expanded = expanded_view(snapshot, persistent),
-    },
-  }
-  if persistent then
-    record.presentation = { reveal = "expanded" }
-    active_alert = context_id
-  else
-    record.expires_in_ms = options.preview_duration_ms
-    if options.preview_duration_ms > 0 then
-      record.presentation = {
-        reveal = "expanded",
-        duration_ms = options.preview_duration_ms,
-      }
-    end
-    active_alert = nil
-  end
-  gisland.publish(record)
-end
-
-local function observe(reading)
-  local alerts = {}
-  local first = previous_on_battery == nil
-  if not first and reading.on_battery ~= previous_on_battery then
-    if reading.on_battery then
-      emitted = {}
-      alerts[#alerts + 1] = "unplugged"
-    else
-      alerts[#alerts + 1] = "plugged"
-    end
-  end
-  previous_on_battery = reading.on_battery
-  if not reading.on_battery then
-    return alerts
-  end
-  local crossed
-  for _, candidate in ipairs {
-    { options.warning_percent, "warning" },
-    { options.persistent_percent, "persistent" },
-    { options.critical_percent, "critical" },
-  } do
-    if reading.percentage <= candidate[1] and not emitted[candidate[1]] then
-      emitted[candidate[1]] = true
-      crossed = candidate[2]
-    end
-  end
-  if crossed ~= nil then
-    alerts[#alerts + 1] = crossed
-  end
-  return alerts
-end
-
-local function update(reading)
-  if not reading.present or reading.percentage ~= reading.percentage or
-    math.abs(reading.percentage) == math.huge then
-    return
-  end
-  local snapshot = snapshot_for(reading)
-  local immediate = last_snapshot == nil or snapshot.percent_text ~= last_snapshot.percent_text or
-    snapshot.semantic_state ~= last_snapshot.semantic_state or snapshot.state_text ~= last_snapshot.state_text
-  local now = GLib.get_monotonic_time() / 1000000.0
-  if immediate or now - last_publish >= 30.0 then
-    gisland.data(snapshot)
-    last_snapshot = snapshot
-    last_publish = now
-  end
-  local alerts = observe(reading)
-  local saved, message = pcall(save_state)
-  if not saved then
-    gisland.log("error", "gisland-battery: cannot save battery state: " .. tostring(message))
-  end
-  for _, alert in ipairs(alerts) do
-    publish_alert(alert, snapshot)
-  end
-end
-
-local function property(proxy, name, default)
-  local value = proxy:get_cached_property(name)
-  if value == nil then
-    return default
-  end
-  return value.value
-end
-
-local state_names = {
-  [1] = "charging",
-  [2] = "discharging",
-  [3] = "empty",
-  [4] = "fully-charged",
-  [5] = "pending-charge",
-  [6] = "pending-discharge",
-}
-
-local function emit_reading()
-  if stopped or root_proxy == nil or device_proxy == nil then
-    return
-  end
-  local state = state_names[math.tointeger(property(device_proxy, "State", 0))] or "unknown"
-  update {
-    percentage = tonumber(property(device_proxy, "Percentage", 0 / 0)),
-    on_battery = not not property(root_proxy, "OnBattery", state == "discharging"),
-    state = state,
-    time_to_empty = math.tointeger(property(device_proxy, "TimeToEmpty", 0)),
-    time_to_full = math.tointeger(property(device_proxy, "TimeToFull", 0)),
-    energy_rate = tonumber(property(device_proxy, "EnergyRate", 0.0)),
-    energy_full = tonumber(property(device_proxy, "EnergyFull", 0.0)),
-    energy_full_design = tonumber(property(device_proxy, "EnergyFullDesign", 0.0)),
-    present = not not property(device_proxy, "IsPresent", false),
-  }
-end
-
-local function start_source()
-  root_proxy = Gio.DBusProxy.new_for_bus_sync(
-    Gio.BusType.SYSTEM,
-    Gio.DBusProxyFlags.NONE,
-    nil,
-    "org.freedesktop.UPower",
-    "/org/freedesktop/UPower",
-    "org.freedesktop.UPower",
-    nil
-  )
-  device_proxy = Gio.DBusProxy.new_for_bus_sync(
-    Gio.BusType.SYSTEM,
-    Gio.DBusProxyFlags.NONE,
-    nil,
-    "org.freedesktop.UPower",
-    "/org/freedesktop/UPower/devices/DisplayDevice",
-    "org.freedesktop.UPower.Device",
-    nil
-  )
-  root_proxy.on_g_properties_changed = emit_reading
-  device_proxy.on_g_properties_changed = emit_reading
-  emit_reading()
-end
-
-local function validate_integer(config, name)
-  local value = config[name]
-  if value == nil then
-    return options[name]
-  end
-  if math.type(value) ~= "integer" then
-    error(name .. " must be an integer")
-  end
+local function integer(value, name)
+  if type(value) ~= "number" or value ~= math.floor(value) then error(name .. " must be an integer") end
   return value
 end
 
-local function configure(config)
-  local unknown = {}
-  for name in pairs(config) do
-    if options[name] == nil then
-      unknown[#unknown + 1] = name
-    end
+local defaults = {
+  warning_percent = 20, persistent_percent = 10, critical_percent = 5,
+  yellow_percent = 30, red_percent = 15, preview_duration_ms = 3000,
+}
+
+return function(api, supplied)
+  supplied = supplied or {}
+  local options = {}
+  for name, default in pairs(defaults) do
+    options[name] = supplied[name] == nil and default or integer(supplied[name], name)
   end
-  table.sort(unknown)
-  if #unknown > 0 then
-    error("unknown battery option: " .. unknown[1])
-  end
-  for name in pairs(options) do
-    options[name] = validate_integer(config, name)
-  end
+  for name in pairs(supplied) do if defaults[name] == nil then error("unknown battery option: " .. name) end end
   if options.critical_percent <= 0 or options.critical_percent >= options.persistent_percent or
-    options.persistent_percent >= options.warning_percent or options.warning_percent > 100 then
-    error(
-      "critical_percent, persistent_percent and warning_percent must satisfy " ..
-        "0 < critical_percent < persistent_percent < warning_percent <= 100"
-    )
+      options.persistent_percent >= options.warning_percent or options.warning_percent > 100 then
+    error("battery thresholds must satisfy 0 < critical < persistent < warning <= 100")
   end
-  if options.red_percent <= 0 or options.red_percent >= options.yellow_percent or
-    options.yellow_percent > 100 then
-    error(
-      "red_percent and yellow_percent must satisfy " ..
-        "0 < red_percent < yellow_percent <= 100"
-    )
+  if options.red_percent <= 0 or options.red_percent >= options.yellow_percent or options.yellow_percent > 100 then
+    error("battery colours must satisfy 0 < red < yellow <= 100")
   end
   if options.preview_duration_ms < 0 or options.preview_duration_ms > 60000 then
     error("preview_duration_ms must be between 0 and 60000")
   end
-end
 
-return gisland.module {
-  init = function(config)
-    configure(config)
-    load_state()
-    local ok, message = pcall(start_source)
-    if not ok then
-      root_proxy = nil
-      device_proxy = nil
-      gisland.log("error", "gisland-battery: UPower unavailable: " .. tostring(message))
+  local stopped, root_proxy, device_proxy, active_alert = false, nil, nil, nil
+  local last_snapshot, last_publish
+  local saved = api.state.load("battery-cycle", {}) or {}
+  local emitted = saved.emitted or {}
+  local previous_on_battery = saved.previous_on_battery
+
+  local function save_state()
+    api.state.save("battery-cycle", {
+      version = 1, emitted = emitted, previous_on_battery = previous_on_battery,
+    })
+  end
+
+  local function round(value)
+    local lower = math.floor(value)
+    local fraction = value - lower
+    if fraction > 0.5 or fraction == 0.5 and lower % 2 == 1 then return lower + 1 end
+    return lower
+  end
+
+  local function duration(seconds)
+    if not seconds or seconds <= 0 then return nil end
+    local minutes = math.floor((seconds + 30) / 60)
+    local hours = math.floor(minutes / 60)
+    if hours > 0 then return string.format("%d h %02d", hours, minutes % 60) end
+    return tostring(minutes) .. " min"
+  end
+
+  local function snapshot(reading)
+    local percentage = math.max(0, math.min(reading.percentage, 100))
+    local estimate = duration(reading.on_battery and reading.time_to_empty or reading.time_to_full)
+    local state_text = reading.state == "charging" and "Charge" or
+      reading.state == "fully-charged" and "Chargée" or
+      reading.on_battery and "Décharge" or "Secteur"
+    local health = "—"
+    if reading.energy_full > 0 and reading.energy_full_design > 0 then
+      health = tostring(round(reading.energy_full / reading.energy_full_design * 100)) .. " %"
     end
-  end,
-  actions = {
-    ["dismiss-alert"] = function()
-      if active_alert == nil then
-        return false
-      end
-      gisland.dismiss(active_alert)
+    local power = reading.energy_rate > 0 and string.format("%.1f W", reading.energy_rate):gsub("%.", ",") or "—"
+    return {
+      level = percentage / 100, percent_text = tostring(round(percentage)) .. " %",
+      semantic_state = percentage > options.yellow_percent and "success" or
+        percentage > options.red_percent and "warning" or "error",
+      estimate_compact = estimate or "Calcul…", state_text = state_text,
+      estimate_detail = estimate and (estimate .. (reading.on_battery and " restantes" or " avant charge complète")) or "—",
+      health_text = health, power_text = power,
+    }
+  end
+
+  local ui = api.ui
+  local function row(label, value)
+    return ui.row { gap = "small", children = {
+      ui.text { value = label, role = "caption" }, ui.spacer { flexible = true }, ui.text { value = value, role = "body" },
+    } }
+  end
+  local function compact_view(value)
+    return ui.row { gap = "small", children = {
+      ui.progress { shape = "ring", value = value.level, state = value.semantic_state },
+      ui.text { value = value.percent_text, role = "compact-primary" }, ui.spacer { flexible = true },
+      ui.text { value = value.estimate_compact, role = "compact-secondary" },
+    } }
+  end
+  local function expanded_view(value, dismissible)
+    local children = {
+      ui.row { gap = "normal", children = {
+        ui.progress { shape = "ring", value = value.level, state = value.semantic_state },
+        ui.text { value = value.percent_text, role = "title" }, ui.spacer { flexible = true },
+        ui.text { value = value.state_text, role = "body" },
+      } }, row("Autonomie", value.estimate_detail), row("Santé", value.health_text), row("Puissance", value.power_text),
+    }
+    if dismissible then children[#children + 1] = ui.button {
+      action_id = "dismiss-alert", accessible_label = "Dismiss battery alert",
+      content = ui.text { value = "Dismiss", role = "button" },
+    } end
+    return ui.column { gap = "normal", children = children }
+  end
+
+  local function publish_alert(kind, value)
+    if active_alert then api.dismiss(active_alert) end
+    local persistent = kind == "persistent" or kind == "critical"
+    local context_id = "battery-" .. kind
+    local spec = {
+      context_id = context_id,
+      priority = ({ plugged = 35, unplugged = 35, warning = 40, persistent = 60, critical = 90 })[kind],
+      views = { compact = compact_view(value), expanded = expanded_view(value, persistent) },
+    }
+    if persistent then
+      spec.presentation = { reveal = "expanded" }
+      active_alert = context_id
+    else
+      spec.expires_in_ms = options.preview_duration_ms
+      if options.preview_duration_ms > 0 then spec.presentation = { reveal = "expanded", duration_ms = options.preview_duration_ms } end
       active_alert = nil
-      return true
+    end
+    api.publish(spec)
+  end
+
+  local function observe(reading)
+    local alerts = {}
+    if previous_on_battery ~= nil and reading.on_battery ~= previous_on_battery then
+      if reading.on_battery then emitted, alerts = {}, { "unplugged" } else alerts = { "plugged" } end
+    end
+    previous_on_battery = reading.on_battery
+    if not reading.on_battery then return alerts end
+    local crossed
+    local thresholds = {
+      { options.warning_percent, "warning" }, { options.persistent_percent, "persistent" },
+      { options.critical_percent, "critical" },
+    }
+    for _, candidate in ipairs(thresholds) do
+      if reading.percentage <= candidate[1] and not emitted[candidate[1]] then
+        emitted[candidate[1]] = true
+        crossed = candidate[2]
+      end
+    end
+    if crossed then alerts[#alerts + 1] = crossed end
+    return alerts
+  end
+
+  local function update(reading)
+    if stopped or not reading.present or reading.percentage ~= reading.percentage then return end
+    local value = snapshot(reading)
+    local now = os.clock()
+    local immediate = not last_snapshot or value.percent_text ~= last_snapshot.percent_text or
+      value.semantic_state ~= last_snapshot.semantic_state or value.state_text ~= last_snapshot.state_text
+    if immediate or not last_publish or now - last_publish >= 30 then
+      api.publish { context_id = "battery", priority = 10,
+        views = { compact = compact_view(value), expanded = expanded_view(value, false) } }
+      last_snapshot, last_publish = value, now
+    end
+    local alerts = observe(reading)
+    local ok, message = pcall(save_state)
+    if not ok then api.log("error", "gisland-battery: cannot save battery state: " .. tostring(message)) end
+    for _, alert in ipairs(alerts) do publish_alert(alert, value) end
+  end
+
+  local state_names = { [1] = "charging", [2] = "discharging", [3] = "empty", [4] = "fully-charged",
+    [5] = "pending-charge", [6] = "pending-discharge" }
+  local function property(proxy, name, default)
+    local value = proxy.get and proxy:get(name) or proxy.property and proxy:property(name)
+    if value == nil then return default end
+    return type(value) == "table" and value.value or value
+  end
+  local function emit_reading()
+    if stopped or not root_proxy or not device_proxy then return end
+    local state = state_names[math.floor(tonumber(property(device_proxy, "State", 0)))] or "unknown"
+    update {
+      percentage = tonumber(property(device_proxy, "Percentage", 0 / 0)),
+      on_battery = not not property(root_proxy, "OnBattery", state == "discharging"), state = state,
+      time_to_empty = tonumber(property(device_proxy, "TimeToEmpty", 0)), time_to_full = tonumber(property(device_proxy, "TimeToFull", 0)),
+      energy_rate = tonumber(property(device_proxy, "EnergyRate", 0)), energy_full = tonumber(property(device_proxy, "EnergyFull", 0)),
+      energy_full_design = tonumber(property(device_proxy, "EnergyFullDesign", 0)), present = not not property(device_proxy, "IsPresent", false),
+    }
+  end
+  local function watch(proxy)
+    if proxy.watch then return proxy:watch(emit_reading) end
+    if proxy.on_change then return proxy:on_change(emit_reading) end
+  end
+  local function poll()
+    if stopped then return end
+    local ok, message = pcall(emit_reading)
+    if not ok then api.log("error", "gisland-battery: UPower read failed: " .. tostring(message)) end
+    api.timer.after(30000, poll)
+  end
+
+  local function start()
+    root_proxy = api.dbus.proxy { bus = "system", name = "org.freedesktop.UPower", path = "/org/freedesktop/UPower", interface = "org.freedesktop.UPower" }
+    device_proxy = api.dbus.proxy { bus = "system", name = "org.freedesktop.UPower", path = "/org/freedesktop/UPower/devices/DisplayDevice", interface = "org.freedesktop.UPower.Device" }
+    watch(root_proxy); watch(device_proxy); poll()
+  end
+
+  return {
+    start = function()
+      local ok, message = pcall(start)
+      if not ok then api.log("error", "gisland-battery: UPower unavailable: " .. tostring(message)) end
     end,
-  },
-  fallback_action = function()
-    return false
-  end,
-  shutdown = function()
-    stopped = true
-    if root_proxy ~= nil then
-      root_proxy.on_g_properties_changed = nil
-    end
-    if device_proxy ~= nil then
-      device_proxy.on_g_properties_changed = nil
-    end
-    root_proxy = nil
-    device_proxy = nil
-  end,
-}
+    actions = { ["dismiss-alert"] = function()
+      if not active_alert then return false end
+      api.dismiss(active_alert); active_alert = nil; return true
+    end },
+    fallback_action = function() return false end,
+    stop = function()
+      stopped = true
+      if root_proxy and root_proxy.close then root_proxy:close() end
+      if device_proxy and device_proxy.close then device_proxy:close() end
+      root_proxy, device_proxy = nil, nil
+    end,
+  }
+end

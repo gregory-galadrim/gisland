@@ -1,213 +1,73 @@
-local command = require("command")
-local ui = gisland.ui
+local platform = require("platform")
 
-local options = {
-  step_percent = 5,
-  maximum_percent = 150,
-  hud_duration_ms = 1500,
-}
-local active_context
+local defaults = { step_percent = 5, maximum_percent = 150, hud_duration_ms = 1500 }
 
-local function require_result(result, operation, timeout_seconds)
-  if result.ok then
-    return result.output
-  end
-  local detail
-  if result.timed_out then
-    detail = "timed out after " .. timeout_seconds .. " seconds"
-  else
-    detail = result.output:gsub("%s+$", "")
-    if detail == "" then
-      detail = "exited with status " .. tostring(result.status)
-    end
-  end
-  error(operation .. " failed: " .. detail, 2)
-end
+return function(api, supplied)
+  local options = platform.copy_options(defaults, supplied, "audio")
+  options.step_percent = platform.integer(options.step_percent, "step_percent", 1, 25)
+  options.maximum_percent = platform.integer(options.maximum_percent, "maximum_percent", 100, 200)
+  options.hud_duration_ms = platform.integer(options.hud_duration_ms, "hud_duration_ms", 100, 60000)
+  local active
 
-local function round_half_even(value)
-  local lower = math.floor(value)
-  local fraction = value - lower
-  if fraction < 0.5 then
-    return lower
+  local function run(argv)
+    local result = api.process.run(argv, { timeout_ms = 2000 })
+    if result.ok then return result.output or "" end
+    local detail = platform.trim(result.output or "")
+    if detail == "" then detail = "exited with status " .. tostring(result.status) end
+    if result.timed_out then detail = "timed out after 2 seconds" end
+    error("pactl failed: " .. detail)
   end
-  if fraction > 0.5 then
-    return lower + 1
-  end
-  return lower % 2 == 0 and lower or lower + 1
-end
 
-local function parse_volume(output)
-  local total = 0
-  local count = 0
-  for value in output:gmatch("/%s*(%d+)%%") do
-    total = total + tonumber(value)
-    count = count + 1
+  local function state()
+    local volume = run({ "pactl", "get-sink-volume", "@DEFAULT_SINK@" })
+    local total, count = 0, 0
+    for value in volume:gmatch("/%s*(%d+)%%") do total, count = total + tonumber(value), count + 1 end
+    if count == 0 then error("pactl returned an invalid sink volume") end
+    local lower = math.floor(total / count)
+    local fraction = total / count - lower
+    if fraction > 0.5 or fraction == 0.5 and lower % 2 == 1 then lower = lower + 1 end
+    local mute = run({ "pactl", "get-sink-mute", "@DEFAULT_SINK@" }):match("^%s*Mute:%s*(%a+)")
+    if mute ~= "yes" and mute ~= "no" then error("pactl returned an invalid sink mute state") end
+    return { volume_percent = lower, muted = mute == "yes" }
   end
-  if count == 0 then
-    error("pactl returned an invalid sink volume", 2)
-  end
-  return round_half_even(total / count)
-end
 
-local function parse_mute(output)
-  local value = output:match("^%s*Mute:%s*(yes)%s*$")
-  if value ~= nil then
+  local function publish(id, view, style)
+    if active ~= nil and active ~= id then api.dismiss(active) end
+    active = id
+    api.publish { context_id = id, priority = 80, expires_in_ms = options.hud_duration_ms,
+      views = { compact = view }, presentation = { compact_style = style, reveal = "compact", duration_ms = options.hud_duration_ms } }
+    api.timer.after(options.hud_duration_ms, function() api.overlay.close() if active == id then active = nil end end)
+  end
+
+  local function change(delta)
+    local before = state()
+    local target = platform.clamp(before.volume_percent + delta, 0, options.maximum_percent)
+    if before.muted then run({ "pactl", "set-sink-mute", "@DEFAULT_SINK@", "0" }) end
+    run({ "pactl", "set-sink-volume", "@DEFAULT_SINK@", tostring(target) .. "%" })
+    local after = state()
+    local icon = (after.muted or after.volume_percent == 0) and "volume-muted" or
+      (after.volume_percent <= options.maximum_percent / 2 and "volume-low" or "volume-high")
+    publish("audio-volume", api.ui.row { gap = "small", children = {
+      api.ui.icon { name = icon, role = "hud-volume-icon", accessible_label = "Volume " .. tostring(after.volume_percent) .. " percent" },
+      api.ui.progress { value = platform.clamp(after.volume_percent / options.maximum_percent, 0, 1),
+        transition_from = platform.clamp(before.volume_percent / options.maximum_percent, 0, 1), state = "foreground" },
+    } }, "hud-meter")
     return true
   end
-  value = output:match("^%s*Mute:%s*(no)%s*$")
-  if value ~= nil then
-    return false
-  end
-  error("pactl returned an invalid sink mute state", 2)
-end
 
-local function read_state()
-  local volume = parse_volume(require_result(command.get_sink_volume(), "pactl get-sink-volume", "2.0"))
-  local muted = parse_mute(require_result(command.get_sink_mute(), "pactl get-sink-mute", "2.0"))
-  return { volume_percent = volume, muted = muted }
-end
-
-local function set_volume(percent)
-  require_result(command.set_sink_volume(percent), "pactl set-sink-volume", "2.0")
-end
-
-local function set_muted(muted)
-  require_result(command.set_sink_mute(muted), "pactl set-sink-mute", "2.0")
-end
-
-local function close_expanded()
-  local result = command.close()
-  if result.ok then
-    return
-  end
-  local detail
-  if result.timed_out then
-    detail = "timed out after 0.5 seconds"
-  else
-    detail = result.output:gsub("%s+$", "")
-    if detail == "" then
-      detail = "exited with status " .. tostring(result.status)
-    end
-  end
-  gisland.log("error", "gisland-audio: gislandctl close failed: " .. detail)
-end
-
-local function replace(context_id, compact, style)
-  if active_context ~= nil and active_context ~= context_id then
-    gisland.dismiss(active_context)
-  end
-  gisland.publish {
-    context_id = context_id,
-    priority = 80,
-    expires_in_ms = options.hud_duration_ms,
-    views = { compact = compact },
-    presentation = { compact_style = style },
+  return {
+    actions = {
+      ["volume-up"] = function() return change(options.step_percent) end,
+      ["volume-down"] = function() return change(-options.step_percent) end,
+      ["toggle-mute"] = function()
+        local before = state()
+        run({ "pactl", "set-sink-mute", "@DEFAULT_SINK@", before.muted and "0" or "1" })
+        local after = state()
+        publish("audio-mute", api.ui.icon { name = after.muted and "volume-muted" or "volume-high",
+          role = "hud-mute-icon", accessible_label = after.muted and "Muted" or "Unmuted" }, "hud-symbol")
+        return true
+      end,
+    },
+    stop = function() active = nil end,
   }
-  active_context = context_id
-  gisland.defer(close_expanded)
 end
-
-local function publish_mute(state)
-  replace(
-    "audio-mute",
-    ui.icon {
-      name = state.muted and "volume-muted" or "volume-high",
-      role = "hud-mute-icon",
-      accessible_label = state.muted and "Muted" or "Unmuted",
-    },
-    "hud-symbol"
-  )
-end
-
-local function clamped_ratio(percent)
-  return math.max(0.0, math.min(percent / options.maximum_percent, 1.0))
-end
-
-local function publish_volume(before, after)
-  local icon
-  if after.muted or after.volume_percent == 0 then
-    icon = "volume-muted"
-  elseif after.volume_percent <= options.maximum_percent / 2 then
-    icon = "volume-low"
-  else
-    icon = "volume-high"
-  end
-  replace(
-    "audio-volume",
-    ui.row {
-      gap = "small",
-      children = {
-        ui.icon {
-          name = icon,
-          role = "hud-volume-icon",
-          accessible_label = "Volume " .. tostring(after.volume_percent) .. " percent",
-        },
-        ui.progress {
-          value = clamped_ratio(after.volume_percent),
-          transition_from = clamped_ratio(before.volume_percent),
-          state = "foreground",
-        },
-      },
-    },
-    "hud-meter"
-  )
-end
-
-local function change_volume(delta)
-  local before = read_state()
-  local target = math.max(0, math.min(before.volume_percent + delta, options.maximum_percent))
-  if before.muted then
-    set_muted(false)
-  end
-  set_volume(target)
-  publish_volume(before, read_state())
-  return true
-end
-
-local function toggle_mute()
-  local before = read_state()
-  set_muted(not before.muted)
-  publish_mute(read_state())
-  return true
-end
-
-local function validate_integer(config, name, minimum, maximum)
-  local value = config[name]
-  if value == nil then
-    return options[name]
-  end
-  if math.type(value) ~= "integer" then
-    error(name .. " must be an integer")
-  end
-  if value < minimum or value > maximum then
-    error(name .. " must be between " .. minimum .. " and " .. maximum)
-  end
-  return value
-end
-
-return gisland.module {
-  init = function(config)
-    local unknown = {}
-    for name in pairs(config) do
-      if options[name] == nil then
-        unknown[#unknown + 1] = name
-      end
-    end
-    table.sort(unknown)
-    if #unknown > 0 then
-      error("unknown audio option: " .. unknown[1])
-    end
-    options.step_percent = validate_integer(config, "step_percent", 1, 25)
-    options.maximum_percent = validate_integer(config, "maximum_percent", 100, 200)
-    options.hud_duration_ms = validate_integer(config, "hud_duration_ms", 100, 60000)
-  end,
-  actions = {
-    ["volume-up"] = function()
-      return change_volume(options.step_percent)
-    end,
-    ["volume-down"] = function()
-      return change_volume(-options.step_percent)
-    end,
-    ["toggle-mute"] = toggle_mute,
-  },
-}

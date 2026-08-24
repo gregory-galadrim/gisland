@@ -1,0 +1,26 @@
+[package]
+name = "gisland"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["unstable-locales"] }
+chrono-tz = "0.10"
+libc = "0.2"
+mlua = { version = "0.12", features = ["luajit", "vendored", "send", "serialize"] }
+notify = "8.2"
+raylib = "6.0"
+pango = "0.22"
+pangocairo = "0.22"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+taffy = { version = "0.13", default-features = false, features = ["std", "taffy_tree", "flexbox"] }
+wait-timeout = "0.2"
+zbus = "5.13"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
