@@ -7,7 +7,7 @@ return function(api, supplied)
   options.step_percent = platform.integer(options.step_percent, "step_percent", 1, 25)
   options.maximum_percent = platform.integer(options.maximum_percent, "maximum_percent", 100, 200)
   options.hud_duration_ms = platform.integer(options.hud_duration_ms, "hud_duration_ms", 100, 60000)
-  local active
+  local active, generation, cached = nil, 0, nil
 
   local function run(argv)
     local result = api.process.run(argv, { timeout_ms = 2000 })
@@ -33,25 +33,38 @@ return function(api, supplied)
 
   local function publish(id, view, style)
     if active ~= nil and active ~= id then api.dismiss(active) end
-    active = id
+    active, generation = id, generation + 1
+    local current = generation
     api.publish { context_id = id, priority = 80, expires_in_ms = options.hud_duration_ms,
       views = { compact = view }, presentation = { compact_style = style, reveal = "compact", duration_ms = options.hud_duration_ms } }
-    api.timer.after(options.hud_duration_ms, function() api.overlay.close() if active == id then active = nil end end)
+    api.timer.after(options.hud_duration_ms, function()
+      if active == id and generation == current then
+        api.overlay.close()
+        active, cached = nil, nil
+      end
+    end)
   end
 
-  local function change(delta)
-    local before = state()
-    local target = platform.clamp(before.volume_percent + delta, 0, options.maximum_percent)
-    if before.muted then run({ "pactl", "set-sink-mute", "@DEFAULT_SINK@", "0" }) end
-    run({ "pactl", "set-sink-volume", "@DEFAULT_SINK@", tostring(target) .. "%" })
-    local after = state()
+  local function meter(before, after)
     local icon = (after.muted or after.volume_percent == 0) and "volume-muted" or
       (after.volume_percent <= options.maximum_percent / 2 and "volume-low" or "volume-high")
-    publish("audio-volume", api.ui.row { gap = "small", children = {
+    return api.ui.row { gap = "normal", children = {
       api.ui.icon { name = icon, role = "hud-volume-icon", accessible_label = "Volume " .. tostring(after.volume_percent) .. " percent" },
       api.ui.progress { value = platform.clamp(after.volume_percent / options.maximum_percent, 0, 1),
         transition_from = platform.clamp(before.volume_percent / options.maximum_percent, 0, 1), state = "foreground" },
-    } }, "hud-meter")
+    } }
+  end
+
+  local function change(delta)
+    local before = cached or state()
+    local target = platform.clamp(before.volume_percent + delta, 0, options.maximum_percent)
+    if before.muted then run({ "pactl", "set-sink-mute", "@DEFAULT_SINK@", "0" }) end
+    if target ~= before.volume_percent then
+      run({ "pactl", "set-sink-volume", "@DEFAULT_SINK@", tostring(target) .. "%" })
+    end
+    local after = { volume_percent = target, muted = false }
+    cached = after
+    publish("audio-volume", meter(before, after), "hud-meter")
     return true
   end
 
@@ -60,14 +73,14 @@ return function(api, supplied)
       ["volume-up"] = function() return change(options.step_percent) end,
       ["volume-down"] = function() return change(-options.step_percent) end,
       ["toggle-mute"] = function()
-        local before = state()
+        local before = cached or state()
         run({ "pactl", "set-sink-mute", "@DEFAULT_SINK@", before.muted and "0" or "1" })
-        local after = state()
-        publish("audio-mute", api.ui.icon { name = after.muted and "volume-muted" or "volume-high",
-          role = "hud-mute-icon", accessible_label = after.muted and "Muted" or "Unmuted" }, "hud-symbol")
+        local after = { volume_percent = before.volume_percent, muted = not before.muted }
+        cached = after
+        publish("audio-volume", meter(before, after), "hud-meter")
         return true
       end,
     },
-    stop = function() active = nil end,
+    stop = function() active, cached = nil, nil end,
   }
 end

@@ -35,8 +35,8 @@ return {
       styles = {
         ["hud-symbol"] = { padding_horizontal = 0, padding_vertical = 0, radius = 19, border = 0,
           min_width = 56, max_width = 56, min_height = 52, max_height = 52 },
-        ["hud-meter"] = { padding_horizontal = 12, padding_vertical = 0, radius = 18, border = 0,
-          min_width = 220, max_width = 220, min_height = 36, max_height = 36 },
+        ["hud-meter"] = { padding_horizontal = 14, padding_vertical = 6, radius = 20, border = 0,
+          min_width = 220, max_width = 220, min_height = 40, max_height = 40 },
       },
     },
     expanded = { padding = 24, radius = 30, border = 0, min_width = 360, max_width = 432,

@@ -24,11 +24,16 @@ pub struct HitRegion {
 
 pub struct Renderer {
     scene: Option<Value>,
-    previous: Option<Value>,
     changed: Instant,
-    visibility_changed: Instant,
-    visibility_from: f32,
+    meter_changed: Instant,
+    meter_from: f32,
+    meter_target: Option<f32>,
+    geometry_changed: Instant,
+    compact_from: (f32, f32, f32, f32, f32),
+    visibility: Visibility,
     visibility_target: f32,
+    visibility_velocity: f32,
+    last_frame: Instant,
     progress: f32,
     pango: pango::Context,
     pub hits: Vec<HitRegion>,
@@ -42,12 +47,17 @@ impl Renderer {
     pub fn new(asset_root: PathBuf) -> Self {
         Self {
             scene: None,
-            previous: None,
             changed: Instant::now(),
-            visibility_changed: Instant::now(),
-            visibility_from: 0.0,
-            visibility_target: 1.0,
-            progress: 1.0,
+            meter_changed: Instant::now(),
+            meter_from: 0.0,
+            meter_target: None,
+            geometry_changed: Instant::now(),
+            compact_from: (230.0, 32.0, 16.0, 14.0, 4.0),
+            visibility: Visibility::Compact,
+            visibility_target: 0.0,
+            visibility_velocity: 0.0,
+            last_frame: Instant::now(),
+            progress: 0.0,
             pango: pangocairo::FontMap::default().create_context(),
             hits: Vec::new(),
             textures: HashMap::new(),
@@ -59,39 +69,72 @@ impl Renderer {
     }
     pub fn set_scene(&mut self, scene: Value) -> Result<()> {
         validate_scene(&scene)?;
-        let animate = self.scene.as_ref().is_none_or(|current| {
+        if let Some((target, declared_from)) = find_progress(&scene) {
+            let speed = self
+                .scene
+                .as_ref()
+                .and_then(|value| value.pointer("/interaction/animation_speed"))
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0) as f32;
+            let current = self.meter_target.map_or(declared_from, |previous| {
+                lerp(
+                    self.meter_from,
+                    previous,
+                    ease_out(
+                        (self.meter_changed.elapsed().as_secs_f32() * speed / 0.27).clamp(0.0, 1.0),
+                    ),
+                )
+            });
+            if self.meter_target.is_none_or(|previous| previous != target) {
+                self.meter_from = current;
+                self.meter_target = Some(target);
+                self.meter_changed = Instant::now();
+            }
+        } else {
+            self.meter_target = None;
+        }
+        let context_changed = self.scene.as_ref().is_none_or(|current| {
             current.get("compact_context") != scene.get("compact_context")
                 || current.get("expanded_context") != scene.get("expanded_context")
-                || ["compact_transitions", "expanded_transitions"]
-                    .iter()
-                    .any(|key| {
-                        scene
-                            .get(key)
-                            .and_then(Value::as_object)
-                            .is_some_and(|transitions| !transitions.is_empty())
-                    })
         });
-        if animate {
-            self.previous = self.scene.replace(scene);
-            self.changed = Instant::now();
-        } else {
-            self.scene = Some(scene);
-            self.previous = None;
+        if context_changed {
+            let target = compact_geometry(self.scene.as_ref());
+            let progress = ease_in_out(
+                (self.geometry_changed.elapsed().as_secs_f32() / 0.325).clamp(0.0, 1.0),
+            );
+            self.compact_from = interpolate_compact(self.compact_from, target, progress);
+            self.geometry_changed = Instant::now();
         }
+        let declared_transition =
+            ["compact_transitions", "expanded_transitions"]
+                .iter()
+                .any(|key| {
+                    scene
+                        .get(key)
+                        .and_then(Value::as_object)
+                        .is_some_and(|transitions| !transitions.is_empty())
+                });
+        if context_changed || declared_transition {
+            self.changed = Instant::now();
+        }
+        self.scene = Some(scene);
         self.measurements.clear();
         Ok(())
     }
     pub fn set_visibility(&mut self, value: Visibility) {
-        self.visibility_from = self.progress;
-        self.visibility_target = match value {
-            Visibility::Hidden => 0.0,
-            Visibility::Compact => 1.0,
-            Visibility::Expanded => 2.0,
+        self.visibility = value;
+        self.visibility_target = if value == Visibility::Expanded {
+            1.0
+        } else {
+            0.0
         };
-        self.visibility_changed = Instant::now();
+        if value == Visibility::Hidden {
+            self.progress = 0.0;
+            self.visibility_velocity = 0.0;
+        }
     }
     pub fn extent(&self) -> (i32, i32) {
-        let expansion = (self.progress - 1.0).clamp(0.0, 1.0);
+        let expansion = self.progress;
         let (compact_width, compact_height, _, _, _) = compact_geometry(self.scene.as_ref());
         (
             (lerp(compact_width, 432.0, expansion) + 40.0) as i32,
@@ -155,21 +198,41 @@ impl Renderer {
             .and_then(|s| s.pointer("/interaction/reduced_motion"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let duration = if reduced { 0.0 } else { 0.325 };
-        let t = if duration == 0.0 {
-            1.0
-        } else {
-            (self.visibility_changed.elapsed().as_secs_f32() / duration).clamp(0.0, 1.0)
-        };
-        self.progress =
-            self.visibility_from + (self.visibility_target - self.visibility_from) * ease(t);
+        let speed = self
+            .scene
+            .as_ref()
+            .and_then(|scene| scene.pointer("/interaction/animation_speed"))
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0) as f32;
+        let now = Instant::now();
+        let delta = now.duration_since(self.last_frame).as_secs_f32();
+        self.last_frame = now;
         self.hits.clear();
-        if self.progress <= 0.001 {
+        if self.visibility == Visibility::Hidden {
             return;
         }
-        let expansion = (self.progress - 1.0).clamp(0.0, 1.0);
+        if reduced {
+            self.progress = self.visibility_target;
+            self.visibility_velocity = 0.0;
+        } else {
+            update_spring(
+                &mut self.progress,
+                &mut self.visibility_velocity,
+                self.visibility_target,
+                delta * speed,
+            );
+        }
+        let expansion = self.progress;
+        let target_geometry = compact_geometry(self.scene.as_ref());
+        let geometry_progress = if reduced {
+            1.0
+        } else {
+            ease_in_out(
+                (self.geometry_changed.elapsed().as_secs_f32() * speed / 0.325).clamp(0.0, 1.0),
+            )
+        };
         let (compact_width, compact_height, compact_radius, compact_padding_x, compact_padding_y) =
-            compact_geometry(self.scene.as_ref());
+            interpolate_compact(self.compact_from, target_geometry, geometry_progress);
         let width = lerp(compact_width, 432.0, expansion);
         let height = lerp(compact_height, 344.0, expansion);
         let radius = lerp(compact_radius, 30.0, expansion);
@@ -182,7 +245,7 @@ impl Renderer {
             20,
             Color::new(0, 0, 0, 246),
         );
-        let surface = if expansion > 0.5 {
+        let surface = if self.visibility == Visibility::Expanded {
             "expanded"
         } else {
             "compact"
@@ -195,21 +258,8 @@ impl Renderer {
             width - padding_x * 2.0,
             height - padding_y * 2.0,
         );
-        let fade_duration = if reduced { 0.0 } else { 0.325 };
-        let fade = if fade_duration == 0.0 {
-            1.0
-        } else {
-            (self.changed.elapsed().as_secs_f32() / fade_duration).clamp(0.0, 1.0)
-        };
-        if fade < 1.0 {
-            if let Some(previous) = self.previous.clone() {
-                self.draw_scene(drawing, &previous, surface, bounds, mouse, 1.0 - fade);
-            }
-        } else {
-            self.previous = None;
-        }
         if let Some(scene) = self.scene.clone() {
-            self.draw_scene(drawing, &scene, surface, bounds, mouse, fade);
+            self.draw_scene(drawing, &scene, surface, bounds, mouse);
         }
     }
     fn draw_scene(
@@ -219,7 +269,6 @@ impl Renderer {
         surface: &str,
         bounds: Rectangle,
         mouse: Vector2,
-        alpha: f32,
     ) {
         let Some(root) = scene.get(surface).filter(|value| !value.is_null()) else {
             return;
@@ -250,6 +299,7 @@ impl Renderer {
         if let Ok(current) = tree.style(root_id) {
             let mut style = current.clone();
             style.size.width = length(bounds.width);
+            style.size.height = length(bounds.height);
             style.max_size.height = length(bounds.height);
             let _ = tree.set_style(root_id, style);
         }
@@ -270,24 +320,40 @@ impl Renderer {
         {
             return;
         }
-        let transition = scene
-            .get(format!("{surface}_transitions"))
-            .and_then(|value| value.get(surface))
-            .and_then(Value::as_str);
         let reduced = scene
             .pointer("/interaction/reduced_motion")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let speed = scene
+            .pointer("/interaction/animation_speed")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0) as f32;
+        let transition = scene
+            .get(format!("{surface}_transitions"))
+            .and_then(|value| value.get(surface))
+            .and_then(Value::as_str);
         let remaining = if reduced {
             0.0
         } else {
-            1.0 - (self.changed.elapsed().as_secs_f32() / 0.25).clamp(0.0, 1.0)
+            1.0 - ease_in_out((self.changed.elapsed().as_secs_f32() * speed / 0.25).clamp(0.0, 1.0))
         };
         let offset = match transition {
             Some("slide-left") => 48.0 * remaining,
             Some("slide-right") => -48.0 * remaining,
             _ => 0.0,
         };
+        let elapsed = if reduced {
+            1000.0
+        } else {
+            self.meter_changed.elapsed().as_secs_f32() * speed
+        };
+        let meter_progress = self.meter_target.map(|target| {
+            lerp(
+                self.meter_from,
+                target,
+                ease_out((elapsed / 0.27).clamp(0.0, 1.0)),
+            )
+        });
         draw_node(
             drawing,
             &tree,
@@ -295,18 +361,33 @@ impl Renderer {
             root_id,
             Vector2::new(bounds.x + offset, bounds.y),
             mouse,
-            alpha,
-            if reduced {
-                1000.0
-            } else {
-                self.changed.elapsed().as_secs_f32()
-            },
+            1.0,
+            elapsed,
+            meter_progress,
             owner,
             &self.textures,
             &resources,
             &self.fonts,
             &mut self.hits,
         );
+    }
+}
+
+fn find_progress(value: &Value) -> Option<(f32, f32)> {
+    match value {
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("progress") {
+                let target = object.get("value")?.as_f64()? as f32;
+                let from = object
+                    .get("transition_from")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(target as f64) as f32;
+                return Some((target, from));
+            }
+            object.values().find_map(find_progress)
+        }
+        Value::Array(array) => array.iter().find_map(find_progress),
+        _ => None,
     }
 }
 
@@ -333,6 +414,20 @@ fn compact_geometry(scene: Option<&Value>) -> (f32, f32, f32, f32, f32) {
         number("radius", 16.0),
         number("padding_horizontal", 14.0),
         number("padding_vertical", 4.0),
+    )
+}
+
+fn interpolate_compact(
+    from: (f32, f32, f32, f32, f32),
+    to: (f32, f32, f32, f32, f32),
+    progress: f32,
+) -> (f32, f32, f32, f32, f32) {
+    (
+        lerp(from.0, to.0, progress),
+        lerp(from.1, to.1, progress),
+        lerp(from.2, to.2, progress),
+        lerp(from.3, to.3, progress),
+        lerp(from.4, to.4, progress),
     )
 }
 
@@ -587,6 +682,7 @@ fn draw_node(
     mouse: Vector2,
     alpha: f32,
     elapsed: f32,
+    meter_progress: Option<f32>,
     owner: Option<String>,
     textures: &HashMap<String, Texture2D>,
     resources: &HashMap<String, String>,
@@ -726,8 +822,9 @@ fn draw_node(
                 .and_then(|v| v.get("transition_from"))
                 .and_then(Value::as_f64)
                 .unwrap_or(target as f64) as f32;
-            let progress =
-                lerp(from, target, ease((elapsed / 0.27).clamp(0.0, 1.0))).clamp(0.0, 1.0);
+            let progress = meter_progress
+                .unwrap_or_else(|| lerp(from, target, ease_out((elapsed / 0.27).clamp(0.0, 1.0))))
+                .clamp(0.0, 1.0);
             if node.and_then(|v| v.get("shape")).and_then(Value::as_str) == Some("ring") {
                 let center = Vector2::new(origin.x + 16.0, origin.y + 16.0);
                 d.draw_ring(
@@ -749,17 +846,27 @@ fn draw_node(
                     color,
                 );
             } else {
-                d.draw_rectangle_rounded(
-                    Rectangle::new(origin.x, origin.y, rect.width, 5.0),
-                    1.0,
-                    10,
-                    Color::new(90, 90, 96, 80),
+                let thickness = 6.0;
+                let track = Rectangle::new(
+                    origin.x,
+                    origin.y + (rect.height - thickness) * 0.5,
+                    rect.width,
+                    thickness,
                 );
+                d.draw_rectangle_rounded(track, 1.0, 10, Color::new(90, 90, 96, 80));
                 d.draw_rectangle_rounded(
-                    Rectangle::new(origin.x, origin.y, rect.width * progress, 5.0),
+                    Rectangle::new(track.x, track.y, track.width * progress, track.height),
                     1.0,
                     10,
-                    color,
+                    if node
+                        .and_then(|value| value.get("state"))
+                        .and_then(Value::as_str)
+                        == Some("foreground")
+                    {
+                        Color::WHITE.alpha(alpha)
+                    } else {
+                        color
+                    },
                 );
             }
         }
@@ -851,6 +958,7 @@ fn draw_node(
                 mouse,
                 alpha,
                 elapsed,
+                meter_progress,
                 owner.clone(),
                 textures,
                 resources,
@@ -970,9 +1078,73 @@ fn draw_shadow(d: &mut RaylibDrawHandle<'_>, rect: Rectangle, radius: f32) {
         );
     }
 }
-fn ease(value: f32) -> f32 {
-    value * value * (3.0 - 2.0 * value)
+fn cubic_bezier(progress: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
+    let sample = |point: f32, control1: f32, control2: f32| {
+        let inverse = 1.0 - point;
+        3.0 * inverse * inverse * point * control1
+            + 3.0 * inverse * point * point * control2
+            + point * point * point
+    };
+    let derivative = |point: f32, control1: f32, control2: f32| {
+        let inverse = 1.0 - point;
+        3.0 * inverse * inverse * control1
+            + 6.0 * inverse * point * (control2 - control1)
+            + 3.0 * point * point * (1.0 - control2)
+    };
+    let progress = progress.clamp(0.0, 1.0);
+    let mut point = progress;
+    for _ in 0..6 {
+        let slope = derivative(point, x1, x2);
+        if slope.abs() < 0.0001 {
+            break;
+        }
+        point = (point - (sample(point, x1, x2) - progress) / slope).clamp(0.0, 1.0);
+    }
+    sample(point, y1, y2)
+}
+
+fn ease_in_out(value: f32) -> f32 {
+    cubic_bezier(value, 0.42, 0.0, 0.58, 1.0)
+}
+
+fn ease_out(value: f32) -> f32 {
+    cubic_bezier(value, 0.0, 0.0, 0.58, 1.0)
+}
+
+fn update_spring(value: &mut f32, velocity: &mut f32, target: f32, delta: f32) {
+    const STIFFNESS: f32 = 220.0;
+    const DAMPING: f32 = 21.36;
+    const MAX_STEP: f32 = 1.0 / 240.0;
+    let mut remaining = delta.clamp(0.0, 0.05);
+    while remaining > 0.0 {
+        let step = remaining.min(MAX_STEP);
+        let acceleration = STIFFNESS * (target - *value) - DAMPING * *velocity;
+        *velocity += acceleration * step;
+        *value += *velocity * step;
+        remaining -= step;
+    }
+    if (target - *value).abs() < 0.0005 && velocity.abs() < 0.005 {
+        *value = target;
+        *velocity = 0.0;
+    }
 }
 fn lerp(from: f32, to: f32, amount: f32) -> f32 {
     from + (to - from) * amount
+}
+
+#[cfg(test)]
+mod tests {
+    use super::update_spring;
+
+    #[test]
+    fn spring_overshoots_then_settles_like_main() {
+        let (mut value, mut velocity, mut peak) = (0.0, 0.0, 0.0_f32);
+        for _ in 0..120 {
+            update_spring(&mut value, &mut velocity, 1.0, 1.0 / 60.0);
+            peak = peak.max(value);
+        }
+        assert!(peak > 1.0);
+        assert_eq!(value, 1.0);
+        assert_eq!(velocity, 0.0);
+    }
 }
