@@ -170,8 +170,14 @@ return function(api, supplied)
     if #buttons > 0 then top[#top + 1] = ui.row { gap = "small", children = array(buttons) } end
     local expanded = ui.column { alignment = "start", gap = "small", children = array(top) }
     if default then expanded = ui.action_region { action_id = default, accessible_label = "Open notification", content = expanded } end
-    local publication = { context_id = "notification-" .. tostring(notification.id), priority = notification.priority, views = { expanded = expanded } }
-    if visible_count == 0 and options.reveal_duration_ms > 0 then publication.presentation = { reveal = "expanded", duration_ms = options.reveal_duration_ms } end
+    local simple = not app_resource and #body == 0 and #buttons == 0
+    local inline_images = #resources - (app_resource and 1 or 0)
+    local style = simple and "notification-small" or inline_images == 0 and "notification" or nil
+    local publication = { context_id = "notification-" .. tostring(notification.id), priority = notification.priority,
+      views = { expanded = expanded }, presentation = { expanded_style = style } }
+    if visible_count == 0 and options.reveal_duration_ms > 0 then
+      publication.presentation.reveal, publication.presentation.duration_ms = "expanded", options.reveal_duration_ms
+    end
     if #resources > 0 then publication.resources = array(resources) end
     return publication, routing
   end

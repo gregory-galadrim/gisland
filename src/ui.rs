@@ -30,6 +30,7 @@ pub struct Renderer {
     meter_target: Option<f32>,
     geometry_changed: Instant,
     compact_from: (f32, f32, f32, f32, f32),
+    expanded_from: (f32, f32, f32, f32, f32),
     visibility: Visibility,
     visibility_target: f32,
     visibility_velocity: f32,
@@ -53,6 +54,7 @@ impl Renderer {
             meter_target: None,
             geometry_changed: Instant::now(),
             compact_from: (230.0, 32.0, 16.0, 14.0, 4.0),
+            expanded_from: (432.0, 344.0, 30.0, 24.0, 24.0),
             visibility: Visibility::Compact,
             visibility_target: 0.0,
             visibility_velocity: 0.0,
@@ -98,11 +100,33 @@ impl Renderer {
                 || current.get("expanded_context") != scene.get("expanded_context")
         });
         if context_changed {
-            let target = compact_geometry(self.scene.as_ref());
+            let speed = self
+                .scene
+                .as_ref()
+                .and_then(|value| value.pointer("/interaction/animation_speed"))
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0) as f32;
             let progress = ease_in_out(
-                (self.geometry_changed.elapsed().as_secs_f32() / 0.325).clamp(0.0, 1.0),
+                (self.geometry_changed.elapsed().as_secs_f32() * speed / 0.325).clamp(0.0, 1.0),
             );
-            self.compact_from = interpolate_compact(self.compact_from, target, progress);
+            self.compact_from = if self.progress >= 0.999 {
+                compact_geometry(Some(&scene))
+            } else {
+                interpolate_compact(
+                    self.compact_from,
+                    compact_geometry(self.scene.as_ref()),
+                    progress,
+                )
+            };
+            self.expanded_from = if self.progress <= 0.001 {
+                expanded_geometry(Some(&scene))
+            } else {
+                interpolate_compact(
+                    self.expanded_from,
+                    expanded_geometry(self.scene.as_ref()),
+                    progress,
+                )
+            };
             self.geometry_changed = Instant::now();
         }
         let declared_transition =
@@ -134,11 +158,38 @@ impl Renderer {
         }
     }
     pub fn extent(&self) -> (i32, i32) {
-        let expansion = self.progress;
-        let (compact_width, compact_height, _, _, _) = compact_geometry(self.scene.as_ref());
+        let reduced = self
+            .scene
+            .as_ref()
+            .and_then(|scene| scene.pointer("/interaction/reduced_motion"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let speed = self
+            .scene
+            .as_ref()
+            .and_then(|scene| scene.pointer("/interaction/animation_speed"))
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0) as f32;
+        let geometry_progress = if reduced {
+            1.0
+        } else {
+            ease_in_out(
+                (self.geometry_changed.elapsed().as_secs_f32() * speed / 0.325).clamp(0.0, 1.0),
+            )
+        };
+        let compact = interpolate_compact(
+            self.compact_from,
+            compact_geometry(self.scene.as_ref()),
+            geometry_progress,
+        );
+        let expanded = interpolate_compact(
+            self.expanded_from,
+            expanded_geometry(self.scene.as_ref()),
+            geometry_progress,
+        );
         (
-            (lerp(compact_width, 432.0, expansion) + 40.0) as i32,
-            (lerp(compact_height, 344.0, expansion) + 40.0) as i32,
+            (lerp(compact.0, expanded.0, self.progress) + 40.0) as i32,
+            (lerp(compact.1, expanded.1, self.progress) + 40.0) as i32,
         )
     }
 
@@ -223,7 +274,6 @@ impl Renderer {
             );
         }
         let expansion = self.progress;
-        let target_geometry = compact_geometry(self.scene.as_ref());
         let geometry_progress = if reduced {
             1.0
         } else {
@@ -231,11 +281,21 @@ impl Renderer {
                 (self.geometry_changed.elapsed().as_secs_f32() * speed / 0.325).clamp(0.0, 1.0),
             )
         };
+        let compact = interpolate_compact(
+            self.compact_from,
+            compact_geometry(self.scene.as_ref()),
+            geometry_progress,
+        );
+        let expanded = interpolate_compact(
+            self.expanded_from,
+            expanded_geometry(self.scene.as_ref()),
+            geometry_progress,
+        );
         let (compact_width, compact_height, compact_radius, compact_padding_x, compact_padding_y) =
-            interpolate_compact(self.compact_from, target_geometry, geometry_progress);
-        let width = lerp(compact_width, 432.0, expansion);
-        let height = lerp(compact_height, 344.0, expansion);
-        let radius = lerp(compact_radius, 30.0, expansion);
+            compact;
+        let width = lerp(compact_width, expanded.0, expansion);
+        let height = lerp(compact_height, expanded.1, expansion);
+        let radius = lerp(compact_radius, expanded.2, expansion);
         let x = (drawing.get_screen_width() as f32 - width) * 0.5;
         let y = 20.0;
         draw_shadow(drawing, Rectangle::new(x, y, width, height), radius);
@@ -250,8 +310,8 @@ impl Renderer {
         } else {
             "compact"
         };
-        let padding_x = lerp(compact_padding_x, 24.0, expansion);
-        let padding_y = lerp(compact_padding_y, 24.0, expansion);
+        let padding_x = lerp(compact_padding_x, expanded.3, expansion);
+        let padding_y = lerp(compact_padding_y, expanded.4, expansion);
         let bounds = Rectangle::new(
             x + padding_x,
             y + padding_y,
@@ -391,10 +451,17 @@ fn find_progress(value: &Value) -> Option<(f32, f32)> {
     }
 }
 
-fn compact_geometry(scene: Option<&Value>) -> (f32, f32, f32, f32, f32) {
-    let base = scene.and_then(|scene| scene.pointer("/theme/view/compact"));
+fn configured_geometry(
+    scene: Option<&Value>,
+    surface: &str,
+    style_path: &str,
+    width_key: &str,
+    height_key: &str,
+    defaults: (f32, f32, f32, f32, f32),
+) -> (f32, f32, f32, f32, f32) {
+    let base = scene.and_then(|scene| scene.pointer(&format!("/theme/view/{surface}")));
     let style = scene
-        .and_then(|scene| scene.pointer("/compact_presentation/compact_style"))
+        .and_then(|scene| scene.pointer(style_path))
         .and_then(Value::as_str)
         .and_then(|name| {
             base.and_then(|base| base.get("styles"))
@@ -409,11 +476,33 @@ fn compact_geometry(scene: Option<&Value>) -> (f32, f32, f32, f32, f32) {
             .unwrap_or(default)
     };
     (
-        number("min_width", 230.0),
-        number("min_height", 32.0),
-        number("radius", 16.0),
-        number("padding_horizontal", 14.0),
-        number("padding_vertical", 4.0),
+        number(width_key, defaults.0),
+        number(height_key, defaults.1),
+        number("radius", defaults.2),
+        number("padding_horizontal", number("padding", defaults.3)),
+        number("padding_vertical", number("padding", defaults.4)),
+    )
+}
+
+fn compact_geometry(scene: Option<&Value>) -> (f32, f32, f32, f32, f32) {
+    configured_geometry(
+        scene,
+        "compact",
+        "/compact_presentation/compact_style",
+        "min_width",
+        "min_height",
+        (230.0, 32.0, 16.0, 14.0, 4.0),
+    )
+}
+
+fn expanded_geometry(scene: Option<&Value>) -> (f32, f32, f32, f32, f32) {
+    configured_geometry(
+        scene,
+        "expanded",
+        "/expanded_presentation/expanded_style",
+        "max_width",
+        "max_height",
+        (432.0, 344.0, 30.0, 24.0, 24.0),
     )
 }
 
@@ -1134,7 +1223,8 @@ fn lerp(from: f32, to: f32, amount: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::update_spring;
+    use super::{expanded_geometry, update_spring};
+    use serde_json::json;
 
     #[test]
     fn spring_overshoots_then_settles_like_main() {
@@ -1146,5 +1236,23 @@ mod tests {
         assert!(peak > 1.0);
         assert_eq!(value, 1.0);
         assert_eq!(velocity, 0.0);
+    }
+
+    #[test]
+    fn expanded_style_overrides_default_geometry() {
+        let scene = json!({
+            "theme": { "view": { "expanded": {
+                "padding": 24, "radius": 30, "max_width": 432, "max_height": 344,
+                "styles": { "notification-small": {
+                    "padding_horizontal": 14, "padding_vertical": 10, "radius": 22,
+                    "max_width": 340, "max_height": 64
+                } }
+            } } },
+            "expanded_presentation": { "expanded_style": "notification-small" }
+        });
+        assert_eq!(
+            expanded_geometry(Some(&scene)),
+            (340.0, 64.0, 22.0, 14.0, 10.0)
+        );
     }
 }
