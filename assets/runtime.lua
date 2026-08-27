@@ -162,9 +162,19 @@ function runtime.start(native, config)
   function self.activate(id, open)
     local record = find_module(id)
     if not record or record.state ~= "running" then return false, "module is not running" end
+    if record.instance.activate then guard(record, "activate", record.instance.activate, open) end
+    if record.state ~= "running" then return false, record.error end
     self.forced = id
     if open then native.overlay("open") end
     present() return true
+  end
+
+  function self.input(kind, value)
+    local record = self.forced and find_module(self.forced)
+    if not record or record.state ~= "running" or not record.instance.input then return false, "module does not accept input" end
+    local handled = guard(record, "input " .. tostring(kind), record.instance.input, kind, value)
+    present()
+    return handled == true, handled == true and nil or "input was not handled"
   end
 
   function self.dismiss(context_id)

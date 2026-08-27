@@ -1,4 +1,4 @@
-use crate::process;
+use crate::{desktop, process};
 use anyhow::{Context, Result, bail};
 use chrono::{Datelike, Local, Locale, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
@@ -47,6 +47,10 @@ pub enum Command {
     Restart {
         instance: String,
         reply: mpsc::Sender<Result<()>>,
+    },
+    Input {
+        kind: String,
+        value: Option<String>,
     },
     Visibility(String),
     Status(mpsc::Sender<Result<Json>>),
@@ -222,6 +226,13 @@ impl App {
                     bool_result(function.call(instance)?)
                 })();
                 let _ = reply.send(result);
+            }
+            Command::Input { kind, value } => {
+                if let Ok(function) = self.runtime.get::<Function>("input")
+                    && let Err(error) = function.call::<MultiValue>((kind, value))
+                {
+                    eprintln!("gisland: input callback failed: {error}");
+                }
             }
             Command::Visibility(value) => {
                 if let Ok(function) = self.runtime.get::<Function>("visibility")
@@ -540,6 +551,7 @@ fn owner_api(
     api.set("time", time_table(lua)?)?;
     api.set("image", image_table(lua)?)?;
     api.set("dbus", dbus_table(lua, owner, events.clone(), services)?)?;
+    api.set("desktop", desktop::table(lua)?)?;
     api.set("uri", uri_table(lua)?)?;
     let overlay = lua.create_table()?;
     for operation in ["open", "close", "toggle"] {

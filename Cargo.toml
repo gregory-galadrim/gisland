@@ -8,6 +8,8 @@ license = "MIT"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["unstable-locales"] }
 chrono-tz = "0.10"
+gio = "0.22"
+gdk-pixbuf = "0.22"
 libc = "0.2"
 mlua = { version = "0.12", features = ["luajit", "vendored", "send", "serialize"] }
 notify = "8.2"

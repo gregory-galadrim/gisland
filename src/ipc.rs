@@ -170,7 +170,7 @@ pub fn client(request: &Request) -> Result<Response> {
 pub fn run_cli(arguments: &[String]) -> Result<i32> {
     if arguments.is_empty() || matches!(arguments[0].as_str(), "help" | "--help") {
         println!(
-            "usage: gislandctl <open|close|toggle|status|modules|reload|module restart|activate|activate-open|dismiss|action> [arguments]"
+            "usage: gislandctl <open|close|toggle|drun|status|modules|reload|module restart|activate|activate-open|dismiss|action> [arguments]"
         );
         return Ok(0);
     }
@@ -204,6 +204,7 @@ fn parse_cli(arguments: &[String]) -> Result<Request> {
         "open",
         "close",
         "toggle",
+        "drun",
         "status",
         "modules",
         "reload",

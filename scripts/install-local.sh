@@ -28,8 +28,10 @@ install -Dm644 packaging/gisland.service "$HOME/.config/systemd/user/gisland.ser
 rm -rf "$prefix/share/gisland/distributed" "$prefix/share/gisland/audio" "$prefix/share/gisland/battery" "$prefix/share/gisland/notifications"
 systemctl --user daemon-reload
 systemctl --user unset-environment LIBGL_DRIVERS_PATH LD_LIBRARY_PATH 2>/dev/null || true
+loader_file=$(direnv exec "$root" printenv GDK_PIXBUF_MODULE_FILE 2>/dev/null || true)
+[[ -z $loader_file ]] || export GDK_PIXBUF_MODULE_FILE=$loader_file
 names=()
-for name in DISPLAY XAUTHORITY; do [[ -v $name ]] && names+=("$name"); done
+for name in DISPLAY XAUTHORITY PATH GDK_PIXBUF_MODULE_FILE XDG_DATA_DIRS XDG_CURRENT_DESKTOP DESKTOP_SESSION; do [[ -v $name ]] && names+=("$name"); done
 ((${#names[@]} == 0)) || systemctl --user import-environment "${names[@]}"
 systemctl --user reset-failed gisland.service 2>/dev/null || true
 systemctl --user enable gisland.service

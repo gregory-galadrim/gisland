@@ -66,6 +66,8 @@ unsafe extern "C" {
 unsafe extern "C" {
     fn XOpenDisplay(name: *const i8) -> *mut c_void;
     fn XDefaultRootWindow(display: *mut c_void) -> usize;
+    fn XGetInputFocus(display: *mut c_void, focus: *mut usize, revert_to: *mut i32) -> i32;
+    fn XSetInputFocus(display: *mut c_void, focus: usize, revert_to: i32, time: usize) -> i32;
     fn XQueryPointer(
         display: *mut c_void,
         window: usize,
@@ -147,6 +149,54 @@ pub fn primary_monitor() -> Option<(i32, i32, i32)> {
         XRRFreeScreenResources(resources);
         XCloseDisplay(display);
         result
+    }
+}
+
+pub fn focused_window() -> Option<usize> {
+    // SAFETY: XGetInputFocus writes to stack values and the display is closed before return.
+    unsafe {
+        let display = XOpenDisplay(std::ptr::null());
+        if display.is_null() {
+            return None;
+        }
+        let mut focus = 0;
+        let mut revert_to = 0;
+        XGetInputFocus(display, &mut focus, &mut revert_to);
+        XCloseDisplay(display);
+        (focus > 1).then_some(focus)
+    }
+}
+
+pub fn focus_window(window: &mut RaylibHandle) {
+    // SAFETY: raylib exposes a live X11 window id and Xlib does not retain it.
+    unsafe {
+        let native = window.get_window_handle();
+        if native.is_null() {
+            return;
+        }
+        let display = XOpenDisplay(std::ptr::null());
+        if display.is_null() {
+            return;
+        }
+        XSetInputFocus(display, *(native.cast::<usize>()), 1, 0);
+        XFlush(display);
+        XCloseDisplay(display);
+    }
+}
+
+pub fn restore_focus(window: usize) {
+    if window <= 1 {
+        return;
+    }
+    // SAFETY: the window id came from XGetInputFocus; Xlib validates stale ids.
+    unsafe {
+        let display = XOpenDisplay(std::ptr::null());
+        if display.is_null() {
+            return;
+        }
+        XSetInputFocus(display, window, 1, 0);
+        XFlush(display);
+        XCloseDisplay(display);
     }
 }
 

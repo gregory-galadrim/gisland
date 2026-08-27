@@ -1,3 +1,4 @@
+mod desktop;
 mod ipc;
 mod lua_runtime;
 mod process;
@@ -77,6 +78,10 @@ fn run() -> Result<()> {
     let mut visibility = Visibility::Compact;
     let mut visibility_name = "compact-active".to_owned();
     let mut pinned = false;
+    let mut drun_active = false;
+    let mut drun_had_focus = false;
+    let mut drun_previous_focus = None;
+    let mut drun_query = desktop::QueryEditor::default();
     let mut hover_left = Instant::now();
     let mut reveal_until: Option<Instant> = None;
     let mut last_extent = renderer.extent();
@@ -132,21 +137,39 @@ fn run() -> Result<()> {
                         eprintln!("gisland: rejected scene: {error:#}");
                     }
                 }
-                LuaEvent::Overlay(operation) => apply_overlay(
-                    &lua,
-                    &mut renderer,
-                    &mut visibility,
-                    &mut visibility_name,
-                    &mut pinned,
-                    &operation,
-                ),
+                LuaEvent::Overlay(operation) => {
+                    apply_overlay(
+                        &lua,
+                        &mut renderer,
+                        &mut visibility,
+                        &mut visibility_name,
+                        &mut pinned,
+                        &operation,
+                    );
+                    if operation == "close" && drun_active {
+                        if window.is_window_focused()
+                            && let Some(previous) = drun_previous_focus
+                        {
+                            x11::restore_focus(previous);
+                        }
+                        drun_active = false;
+                        drun_had_focus = false;
+                        drun_previous_focus = None;
+                        drun_query.clear();
+                    }
+                }
                 LuaEvent::Dbus(call) => {
                     let _ = lua.send(LuaCommand::Dbus(call));
                 }
             }
         }
         while let Ok(envelope) = controls.try_recv() {
-            dispatch_control(
+            let command = envelope.request.command.clone();
+            let opening_drun = command == "drun";
+            if opening_drun && !drun_active {
+                drun_previous_focus = x11::focused_window();
+            }
+            let succeeded = dispatch_control(
                 envelope,
                 &lua,
                 &mut renderer,
@@ -154,6 +177,119 @@ fn run() -> Result<()> {
                 &mut visibility_name,
                 &mut pinned,
             );
+            if opening_drun && succeeded {
+                drun_active = true;
+                drun_had_focus = false;
+                drun_query.clear();
+                x11::focus_window(&mut window);
+            } else if opening_drun {
+                if let Some(previous) = drun_previous_focus.take() {
+                    x11::restore_focus(previous);
+                }
+            } else if command == "close" && drun_active {
+                if window.is_window_focused()
+                    && let Some(previous) = drun_previous_focus
+                {
+                    x11::restore_focus(previous);
+                }
+                drun_active = false;
+                drun_had_focus = false;
+                drun_previous_focus = None;
+                drun_query.clear();
+            }
+        }
+        if drun_active {
+            if window.is_window_focused() {
+                drun_had_focus = true;
+            } else if drun_had_focus {
+                drun_active = false;
+                drun_had_focus = false;
+                drun_previous_focus = None;
+                drun_query.clear();
+                apply_overlay(
+                    &lua,
+                    &mut renderer,
+                    &mut visibility,
+                    &mut visibility_name,
+                    &mut pinned,
+                    "close",
+                );
+            }
+        }
+        if drun_active {
+            let control = window.is_key_down(KeyboardKey::KEY_LEFT_CONTROL)
+                || window.is_key_down(KeyboardKey::KEY_RIGHT_CONTROL);
+            let repeated = |key| window.is_key_pressed(key) || window.is_key_pressed_repeat(key);
+            let left = repeated(KeyboardKey::KEY_LEFT);
+            let right = repeated(KeyboardKey::KEY_RIGHT);
+            let home = repeated(KeyboardKey::KEY_HOME);
+            let end = repeated(KeyboardKey::KEY_END);
+            let backspace = repeated(KeyboardKey::KEY_BACKSPACE);
+            let delete = repeated(KeyboardKey::KEY_DELETE);
+            let up = repeated(KeyboardKey::KEY_UP);
+            let down = repeated(KeyboardKey::KEY_DOWN);
+            let mut edited = false;
+            let mut moved = false;
+
+            if control && window.is_key_pressed(KeyboardKey::KEY_A) {
+                moved |= drun_query.select_all();
+            }
+            if left {
+                moved |= drun_query.left(control);
+            }
+            if right {
+                moved |= drun_query.right(control);
+            }
+            if home {
+                moved |= drun_query.home();
+            }
+            if end {
+                moved |= drun_query.end();
+            }
+            while let Some(character) = window.get_char_pressed() {
+                if !character.is_control() {
+                    edited |= drun_query.insert(character);
+                }
+            }
+            if backspace {
+                edited |= drun_query.backspace(control);
+            }
+            if delete {
+                edited |= drun_query.delete(control);
+            }
+            if edited {
+                let text = drun_query.text();
+                let _ = lua.send(LuaCommand::Input {
+                    kind: "query".into(),
+                    value: Some(format!("{text}\0{}", drun_query.display())),
+                });
+            } else if moved {
+                let _ = lua.send(LuaCommand::Input {
+                    kind: "cursor".into(),
+                    value: Some(drun_query.display()),
+                });
+            }
+
+            for (triggered, kind) in [
+                (up, "up"),
+                (down, "down"),
+                (window.is_key_pressed(KeyboardKey::KEY_ENTER), "enter"),
+                (window.is_key_pressed(KeyboardKey::KEY_ESCAPE), "escape"),
+            ] {
+                if triggered {
+                    let _ = lua.send(LuaCommand::Input {
+                        kind: kind.into(),
+                        value: None,
+                    });
+                }
+            }
+            let wheel = window.get_mouse_wheel_move();
+            if wheel != 0.0 {
+                let _ = lua.send(LuaCommand::Input {
+                    kind: if wheel > 0.0 { "up" } else { "down" }.into(),
+                    value: None,
+                });
+            }
         }
         let mouse =
             x11::pointer_position(&mut window).unwrap_or_else(|| window.get_mouse_position());
@@ -226,6 +362,12 @@ fn run() -> Result<()> {
         drop(drawing);
         std::thread::sleep(Duration::from_micros(16_667).saturating_sub(frame_started.elapsed()));
     }
+    if drun_active
+        && window.is_window_focused()
+        && let Some(previous) = drun_previous_focus
+    {
+        x11::restore_focus(previous);
+    }
     let _ = lua.send(LuaCommand::Stop);
     if let Ok(path) = ipc::runtime_path("gisland.sock") {
         let _ = std::fs::remove_file(path);
@@ -289,7 +431,7 @@ fn dispatch_control(
     visibility: &mut Visibility,
     name: &mut String,
     pinned: &mut bool,
-) {
+) -> bool {
     let request = envelope.request;
     let response = match request.command.as_str() {
         "open" => {
@@ -304,6 +446,11 @@ fn dispatch_control(
             apply_overlay(lua, renderer, visibility, name, pinned, "toggle");
             ipc::ok(None)
         }
+        "drun" => simple_lua(lua, |reply| LuaCommand::Activate {
+            instance: "drun".into(),
+            open: true,
+            reply,
+        }),
         "status" => match lua_status(lua) {
             Ok(value) => ipc::ok(Some(ipc::basic_status(name, value))),
             Err(error) => ipc::failure(error),
@@ -342,7 +489,7 @@ fn dispatch_control(
                     let _ = envelope
                         .reply
                         .send(ipc::failure("usage: gislandctl action [instance] <action>"));
-                    return;
+                    return false;
                 }
             };
             simple_lua(lua, |reply| LuaCommand::Action {
@@ -353,7 +500,9 @@ fn dispatch_control(
         }
         other => ipc::failure(format!("unknown command: {other}")),
     };
+    let succeeded = response.ok;
     let _ = envelope.reply.send(response);
+    succeeded
 }
 fn simple_lua(
     lua: &lua_runtime::Handle,

@@ -59,8 +59,25 @@ impl Renderer {
     }
     pub fn set_scene(&mut self, scene: Value) -> Result<()> {
         validate_scene(&scene)?;
-        self.previous = self.scene.replace(scene);
-        self.changed = Instant::now();
+        let animate = self.scene.as_ref().is_none_or(|current| {
+            current.get("compact_context") != scene.get("compact_context")
+                || current.get("expanded_context") != scene.get("expanded_context")
+                || ["compact_transitions", "expanded_transitions"]
+                    .iter()
+                    .any(|key| {
+                        scene
+                            .get(key)
+                            .and_then(Value::as_object)
+                            .is_some_and(|transitions| !transitions.is_empty())
+                    })
+        });
+        if animate {
+            self.previous = self.scene.replace(scene);
+            self.changed = Instant::now();
+        } else {
+            self.scene = Some(scene);
+            self.previous = None;
+        }
         self.measurements.clear();
         Ok(())
     }
@@ -106,6 +123,8 @@ impl Renderer {
                     if let Some(path) = path.to_str()
                         && let Ok(font) = window.load_font_ex(thread, path, 64, Some(&characters))
                     {
+                        font.texture()
+                            .set_texture_filter(thread, TextureFilter::TEXTURE_FILTER_BILINEAR);
                         self.fonts.insert(name.clone(), font);
                     }
                 }
@@ -122,8 +141,9 @@ impl Renderer {
             }
             let path = source.strip_prefix("file://").unwrap_or(&source);
             if Path::new(path).is_file()
-                && let Ok(texture) = window.load_texture(thread, path)
+                && let Some(texture) = texture_from_path(window, thread, path)
             {
+                texture.set_texture_filter(thread, TextureFilter::TEXTURE_FILTER_BILINEAR);
                 self.textures.insert(source, texture);
             }
         }
@@ -316,6 +336,24 @@ fn compact_geometry(scene: Option<&Value>) -> (f32, f32, f32, f32, f32) {
     )
 }
 
+fn texture_from_path(
+    window: &mut RaylibHandle,
+    thread: &RaylibThread,
+    path: &str,
+) -> Option<Texture2D> {
+    if Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+    {
+        let pixbuf = gdk_pixbuf::Pixbuf::from_file_at_scale(path, 64, 64, true).ok()?;
+        let png = pixbuf.save_to_bufferv("png", &[]).ok()?;
+        let image = Image::load_image_from_mem(".png", &png).ok()?;
+        window.load_texture_from_image(thread, &image).ok()
+    } else {
+        window.load_texture(thread, path).ok()
+    }
+}
+
 fn validate_scene(scene: &Value) -> Result<()> {
     let object = scene
         .as_object()
@@ -418,12 +456,17 @@ fn build_node(
             tree.new_with_children(style, &ids)?
         }
         "button" | "action_region" => {
+            let input = node.get("style").and_then(Value::as_str) == Some("input");
             style.align_items = Some(AlignItems::CENTER);
+            if input {
+                style.size.width = percent(1.0);
+            }
+            let (horizontal, vertical) = if input { (10.0, 8.0) } else { (6.0, 4.0) };
             style.padding = Rect {
-                left: length(6.0),
-                right: length(6.0),
-                top: length(4.0),
-                bottom: length(4.0),
+                left: length(horizontal),
+                right: length(horizontal),
+                top: length(vertical),
+                bottom: length(vertical),
             };
             let child = build_node(tree, nodes, node.get("content").unwrap())?;
             tree.new_with_children(style, &[child])?
@@ -495,10 +538,17 @@ fn measure_leaf(
                 height: height as f32,
             }
         }
-        "icon" => Size {
-            width: 20.0,
-            height: 20.0,
-        },
+        "icon" => {
+            let size = if node.get("name").and_then(Value::as_str) == Some("application") {
+                32.0
+            } else {
+                20.0
+            };
+            Size {
+                width: size,
+                height: size,
+            }
+        }
         "image" => Size {
             width: 32.0,
             height: 32.0,
@@ -607,6 +657,7 @@ fn draw_node(
                 .and_then(|v| v.get("name"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            let application = name == "application";
             let codepoint = match name {
                 "chevron-left" => 0xF053,
                 "chevron-right" => 0xF054,
@@ -616,11 +667,26 @@ fn draw_node(
                 "volume-high" => 0xF028,
                 _ => 0xF111,
             };
-            let symbol = char::from_u32(codepoint).unwrap_or('•').to_string();
-            if let Some(font) = fonts.get("icons") {
-                d.draw_text_ex(font, &symbol, origin, 20.0, 0.0, color);
+            let symbol = if application {
+                "?".to_owned()
             } else {
-                d.draw_text("•", origin.x as i32, origin.y as i32, 20, color);
+                char::from_u32(codepoint).unwrap_or('•').to_string()
+            };
+            let icon_origin = if application {
+                Vector2::new(origin.x + 6.0, origin.y + 6.0)
+            } else {
+                origin
+            };
+            if let Some(font) = fonts.get(if application { "regular" } else { "icons" }) {
+                d.draw_text_ex(font, &symbol, icon_origin, 20.0, 0.0, color);
+            } else {
+                d.draw_text(
+                    if application { "?" } else { "•" },
+                    icon_origin.x as i32,
+                    icon_origin.y as i32,
+                    20,
+                    color,
+                );
             }
         }
         "image" => {
@@ -719,6 +785,26 @@ fn draw_node(
                 d.draw_circle_v(center, 8.0 * pulse, color.alpha(0.28));
             }
             d.draw_circle_v(center, 3.5, color);
+        }
+        "button" | "action_region"
+            if node
+                .and_then(|value| value.get("style"))
+                .and_then(Value::as_str)
+                == Some("input") =>
+        {
+            d.draw_rectangle_rounded(
+                rect,
+                0.35,
+                10,
+                Color::new(28, 28, 30, (255.0 * alpha) as u8),
+            );
+            d.draw_rectangle_rounded_lines_ex(
+                rect,
+                0.35,
+                10,
+                1.5,
+                Color::new(124, 92, 252, (190.0 * alpha) as u8),
+            );
         }
         "button" | "action_region" if hovered => d.draw_rectangle_rounded(
             rect,
@@ -849,7 +935,9 @@ fn node_color(node: Option<&Value>, alpha: f32) -> Color {
         .and_then(|v| v.get("state").or_else(|| v.get("role")))
         .and_then(Value::as_str);
     let color = match role {
-        Some("muted" | "caption" | "compact-secondary") => Color::new(139, 139, 147, 255),
+        Some("muted" | "input-muted" | "caption" | "compact-secondary") => {
+            Color::new(139, 139, 147, 255)
+        }
         Some("accent") => Color::new(124, 92, 252, 255),
         Some("success") => Color::new(48, 209, 88, 255),
         Some("warning") => Color::new(255, 214, 10, 255),

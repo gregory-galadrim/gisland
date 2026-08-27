@@ -6,7 +6,7 @@ in pkgs.mkShell {
   packages = with pkgs; [
     cargo rustc clang llvmPackages.libclang cmake pkg-config
     alsa-lib libGL mesa
-    glib dbus cairo pango gdk-pixbuf gtk3 luajit xorg-server patchelf
+    glib dbus cairo pango gdk-pixbuf librsvg gtk3 luajit xorg-server patchelf
   ] ++ x11;
 
   CMAKE_INCLUDE_PATH = pkgs.lib.concatStringsSep ":" (map (package: "${package.dev}/include") x11);
