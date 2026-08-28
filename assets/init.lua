@@ -7,6 +7,7 @@ return {
     { id = "clock", source = "modules.clock-calendar.clock_calendar", enabled = true,
       options = { week_start = "monday" } },
     { id = "drun", source = "modules.drun.drun", enabled = true, options = {} },
+    { id = "power-menu", source = "modules.power-menu.power_menu", enabled = true, options = {} },
     { id = "notifications", source = "modules.notifications.notifications", enabled = true, options = {} },
     { id = "battery", source = "modules.battery.battery", enabled = true, options = {} },
     { id = "audio", source = "modules.audio.audio", enabled = true,

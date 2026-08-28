@@ -3,8 +3,8 @@ return function(api, supplied)
   local query, display, selected, results = "", "", 1, {}
 
   local function close()
-    api.dismiss("drun")
     api.overlay.close()
+    api.dismiss("drun")
     return true
   end
 

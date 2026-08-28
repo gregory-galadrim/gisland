@@ -78,9 +78,9 @@ fn run() -> Result<()> {
     let mut visibility = Visibility::Compact;
     let mut visibility_name = "compact-active".to_owned();
     let mut pinned = false;
-    let mut drun_active = false;
-    let mut drun_had_focus = false;
-    let mut drun_previous_focus = None;
+    let mut input_owner: Option<String> = None;
+    let mut input_had_focus = false;
+    let mut input_previous_focus = None;
     let mut drun_query = desktop::QueryEditor::default();
     let mut hover_left = Instant::now();
     let mut reveal_until: Option<Instant> = None;
@@ -146,15 +146,15 @@ fn run() -> Result<()> {
                         &mut pinned,
                         &operation,
                     );
-                    if operation == "close" && drun_active {
+                    if matches!(operation.as_str(), "close" | "collapse") && input_owner.is_some() {
                         if window.is_window_focused()
-                            && let Some(previous) = drun_previous_focus
+                            && let Some(previous) = input_previous_focus
                         {
                             x11::restore_focus(previous);
                         }
-                        drun_active = false;
-                        drun_had_focus = false;
-                        drun_previous_focus = None;
+                        input_owner = None;
+                        input_had_focus = false;
+                        input_previous_focus = None;
                         drun_query.clear();
                     }
                 }
@@ -165,9 +165,16 @@ fn run() -> Result<()> {
         }
         while let Ok(envelope) = controls.try_recv() {
             let command = envelope.request.command.clone();
-            let opening_drun = command == "drun";
-            if opening_drun && !drun_active {
-                drun_previous_focus = x11::focused_window();
+            let opening_input = if command == "drun" {
+                Some("drun".to_owned())
+            } else if command == "activate-open" && envelope.request.args.len() == 1 {
+                Some(envelope.request.args[0].clone())
+            } else {
+                None
+            };
+            let was_inactive = input_owner.is_none();
+            if opening_input.is_some() && was_inactive {
+                input_previous_focus = x11::focused_window();
             }
             let succeeded = dispatch_control(
                 envelope,
@@ -177,34 +184,36 @@ fn run() -> Result<()> {
                 &mut visibility_name,
                 &mut pinned,
             );
-            if opening_drun && succeeded {
-                drun_active = true;
-                drun_had_focus = false;
+            if let Some(owner) = opening_input.as_ref()
+                && succeeded
+            {
+                input_owner = Some(owner.clone());
+                input_had_focus = false;
                 drun_query.clear();
                 x11::focus_window(&mut window);
-            } else if opening_drun {
-                if let Some(previous) = drun_previous_focus.take() {
+            } else if opening_input.is_some() && was_inactive {
+                if let Some(previous) = input_previous_focus.take() {
                     x11::restore_focus(previous);
                 }
-            } else if command == "close" && drun_active {
+            } else if command == "close" && input_owner.is_some() {
                 if window.is_window_focused()
-                    && let Some(previous) = drun_previous_focus
+                    && let Some(previous) = input_previous_focus
                 {
                     x11::restore_focus(previous);
                 }
-                drun_active = false;
-                drun_had_focus = false;
-                drun_previous_focus = None;
+                input_owner = None;
+                input_had_focus = false;
+                input_previous_focus = None;
                 drun_query.clear();
             }
         }
-        if drun_active {
+        if input_owner.is_some() {
             if window.is_window_focused() {
-                drun_had_focus = true;
-            } else if drun_had_focus {
-                drun_active = false;
-                drun_had_focus = false;
-                drun_previous_focus = None;
+                input_had_focus = true;
+            } else if input_had_focus {
+                input_owner = None;
+                input_had_focus = false;
+                input_previous_focus = None;
                 drun_query.clear();
                 apply_overlay(
                     &lua,
@@ -216,63 +225,68 @@ fn run() -> Result<()> {
                 );
             }
         }
-        if drun_active {
-            let control = window.is_key_down(KeyboardKey::KEY_LEFT_CONTROL)
-                || window.is_key_down(KeyboardKey::KEY_RIGHT_CONTROL);
+        if let Some(owner) = input_owner.as_deref() {
             let repeated = |key| window.is_key_pressed(key) || window.is_key_pressed_repeat(key);
             let left = repeated(KeyboardKey::KEY_LEFT);
             let right = repeated(KeyboardKey::KEY_RIGHT);
-            let home = repeated(KeyboardKey::KEY_HOME);
-            let end = repeated(KeyboardKey::KEY_END);
-            let backspace = repeated(KeyboardKey::KEY_BACKSPACE);
-            let delete = repeated(KeyboardKey::KEY_DELETE);
             let up = repeated(KeyboardKey::KEY_UP);
             let down = repeated(KeyboardKey::KEY_DOWN);
-            let mut edited = false;
-            let mut moved = false;
 
-            if control && window.is_key_pressed(KeyboardKey::KEY_A) {
-                moved |= drun_query.select_all();
-            }
-            if left {
-                moved |= drun_query.left(control);
-            }
-            if right {
-                moved |= drun_query.right(control);
-            }
-            if home {
-                moved |= drun_query.home();
-            }
-            if end {
-                moved |= drun_query.end();
-            }
-            while let Some(character) = window.get_char_pressed() {
-                if !character.is_control() {
-                    edited |= drun_query.insert(character);
+            if owner == "drun" {
+                let control = window.is_key_down(KeyboardKey::KEY_LEFT_CONTROL)
+                    || window.is_key_down(KeyboardKey::KEY_RIGHT_CONTROL);
+                let home = repeated(KeyboardKey::KEY_HOME);
+                let end = repeated(KeyboardKey::KEY_END);
+                let backspace = repeated(KeyboardKey::KEY_BACKSPACE);
+                let delete = repeated(KeyboardKey::KEY_DELETE);
+                let mut edited = false;
+                let mut moved = false;
+
+                if control && window.is_key_pressed(KeyboardKey::KEY_A) {
+                    moved |= drun_query.select_all();
                 }
-            }
-            if backspace {
-                edited |= drun_query.backspace(control);
-            }
-            if delete {
-                edited |= drun_query.delete(control);
-            }
-            if edited {
-                let text = drun_query.text();
-                let _ = lua.send(LuaCommand::Input {
-                    kind: "query".into(),
-                    value: Some(format!("{text}\0{}", drun_query.display())),
-                });
-            } else if moved {
-                let _ = lua.send(LuaCommand::Input {
-                    kind: "cursor".into(),
-                    value: Some(drun_query.display()),
-                });
+                if left {
+                    moved |= drun_query.left(control);
+                }
+                if right {
+                    moved |= drun_query.right(control);
+                }
+                if home {
+                    moved |= drun_query.home();
+                }
+                if end {
+                    moved |= drun_query.end();
+                }
+                while let Some(character) = window.get_char_pressed() {
+                    if !character.is_control() {
+                        edited |= drun_query.insert(character);
+                    }
+                }
+                if backspace {
+                    edited |= drun_query.backspace(control);
+                }
+                if delete {
+                    edited |= drun_query.delete(control);
+                }
+                if edited {
+                    let text = drun_query.text();
+                    let _ = lua.send(LuaCommand::Input {
+                        kind: "query".into(),
+                        value: Some(format!("{text}\0{}", drun_query.display())),
+                    });
+                } else if moved {
+                    let _ = lua.send(LuaCommand::Input {
+                        kind: "cursor".into(),
+                        value: Some(drun_query.display()),
+                    });
+                }
             }
 
             for (triggered, kind) in [
                 (up, "up"),
                 (down, "down"),
+                (owner != "drun" && left, "left"),
+                (owner != "drun" && right, "right"),
                 (window.is_key_pressed(KeyboardKey::KEY_ENTER), "enter"),
                 (window.is_key_pressed(KeyboardKey::KEY_ESCAPE), "escape"),
             ] {
@@ -362,9 +376,9 @@ fn run() -> Result<()> {
         drop(drawing);
         std::thread::sleep(Duration::from_micros(16_667).saturating_sub(frame_started.elapsed()));
     }
-    if drun_active
+    if input_owner.is_some()
         && window.is_window_focused()
-        && let Some(previous) = drun_previous_focus
+        && let Some(previous) = input_previous_focus
     {
         x11::restore_focus(previous);
     }
@@ -411,6 +425,10 @@ fn apply_overlay(
         "close" => {
             *pinned = false;
             set_visibility(lua, renderer, visibility, name, Visibility::Hidden);
+        }
+        "collapse" => {
+            *pinned = false;
+            set_visibility(lua, renderer, visibility, name, Visibility::Compact);
         }
         "toggle" if *visibility == Visibility::Hidden => {
             *pinned = true;

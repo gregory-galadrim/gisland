@@ -556,7 +556,12 @@ fn owner_api(
     let overlay = lua.create_table()?;
     for operation in ["open", "close", "toggle"] {
         let sender = events.clone();
-        let value = operation.to_owned();
+        let value = if operation == "close" {
+            "collapse"
+        } else {
+            operation
+        }
+        .to_owned();
         overlay.set(
             operation,
             lua.create_function(move |_, ()| {

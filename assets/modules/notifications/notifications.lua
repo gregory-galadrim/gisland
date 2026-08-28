@@ -244,7 +244,7 @@ return function(api, supplied)
     return tostring(math.floor(elapsed / 86400)) .. " j"
   end
   function history_publication()
-    local children = { ui.row { gap = "small", children = { text("Notifications", "title"), ui.spacer { flexible = true }, ui.button { action_id = "history:" .. tostring(session) .. ":close-all", accessible_label = "Masquer toutes les notifications", content = ui.icon { name = "close" } } } } }
+    local children = { text("Notifications", "title") }
     local count = 0
     for _, record in ipairs(history) do
       if not hidden[record.sequence] and count < visible_count then
@@ -258,8 +258,8 @@ return function(api, supplied)
   end
   local function close_history()
     cancel(open_timer); cancel(inactivity_timer); open_timer, inactivity_timer = nil, nil
-    api.dismiss("history"); visible_count, history_was_expanded, hidden = 0, false, {}
     if api.overlay and api.overlay.close then api.overlay.close() end
+    api.dismiss("history"); visible_count, history_was_expanded, hidden = 0, false, {}
   end
   local function show_more()
     if visible_count == 0 then session, hidden = session + 1, {} end
@@ -273,8 +273,7 @@ return function(api, supplied)
   local function invoke(action_id)
     local hsession, operation, sequence = action_id:match("^history:(%d+):([%a%-]+):?(%d*)$")
     if hsession then
-      if tonumber(hsession) ~= session or visible_count == 0 then return false end
-      if operation == "close-all" then close_history(); return true end
+      if tonumber(hsession) ~= session or visible_count == 0 or operation ~= "hide" then return false end
       sequence = tonumber(sequence); hidden[sequence] = true; visible_count = visible_count - 1
       if visible_count == 0 then close_history() else api.publish(history_publication()) end
       return true
