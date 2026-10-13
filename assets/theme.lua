@@ -6,7 +6,7 @@ return {
     success = "#30D158", warning = "#FF9F0A", error = "#FF453A", danger = "#DC2626",
   },
   fonts = {
-    regular = "fonts/Inter-Regular.ttf", semibold = "fonts/Inter-SemiBold.ttf",
+    regular = "fonts/LiberationSans-Regular.ttf", semibold = "fonts/LiberationSans-Bold.ttf",
     icons = "fonts/Font-Awesome-6-Free-Solid-900.otf",
   },
   typography = {

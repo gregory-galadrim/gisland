@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use pango::prelude::*;
-use raylib::prelude::*;
+use raylib::{core::AsRawMut, prelude::*};
 use serde_json::Value;
 use std::{
     collections::{BTreeSet, HashMap},
@@ -41,6 +41,7 @@ pub struct Renderer {
     textures: HashMap<String, Texture2D>,
     fonts: HashMap<String, Font>,
     font_characters: String,
+    canvas: Option<RenderTexture2D>,
     asset_root: PathBuf,
     measurements: HashMap<String, (f32, f32)>,
 }
@@ -65,6 +66,7 @@ impl Renderer {
             textures: HashMap::new(),
             fonts: HashMap::new(),
             font_characters: String::new(),
+            canvas: None,
             asset_root,
             measurements: HashMap::new(),
         }
@@ -206,6 +208,19 @@ impl Renderer {
     }
 
     pub fn prepare(&mut self, window: &mut RaylibHandle, thread: &RaylibThread) {
+        let width = window.get_screen_width().max(1) as u32 * 2;
+        let height = window.get_screen_height().max(1) as u32 * 2;
+        if self.canvas.as_ref().is_none_or(|canvas| {
+            canvas.texture().width() < width as i32 || canvas.texture().height() < height as i32
+        }) {
+            self.canvas = window.load_render_texture(thread, width, height).ok();
+            if let Some(canvas) = &self.canvas {
+                canvas
+                    .texture()
+                    .set_texture_filter(thread, TextureFilter::TEXTURE_FILTER_BILINEAR);
+            }
+        }
+
         let mut characters = (32_u8..=126).map(char::from).collect::<BTreeSet<_>>();
         if let Some(scene) = &self.scene {
             collect_font_characters(scene, &mut characters);
@@ -227,10 +242,17 @@ impl Renderer {
                         self.asset_root.join(source)
                     };
                     if let Some(path) = path.to_str()
-                        && let Ok(font) = window.load_font_ex(thread, path, 64, Some(&characters))
+                        && let Ok(mut font) =
+                            window.load_font_ex(thread, path, 128, Some(&characters))
                     {
+                        // Mipmaps prevent small text aliasing; the larger atlas keeps large text sharp.
+                        // SAFETY: only texture mip levels change; ownership and glyph storage remain intact.
+                        unsafe {
+                            let raw: &mut raylib::ffi::Font = font.as_raw_mut();
+                            raylib::ffi::GenTextureMipmaps(&mut raw.texture);
+                        }
                         font.texture()
-                            .set_texture_filter(thread, TextureFilter::TEXTURE_FILTER_BILINEAR);
+                            .set_texture_filter(thread, TextureFilter::TEXTURE_FILTER_TRILINEAR);
                         self.fonts.insert(name.clone(), font);
                     }
                 }
@@ -260,7 +282,65 @@ impl Renderer {
             }
         }
     }
-    pub fn draw(&mut self, drawing: &mut RaylibDrawHandle<'_>, mouse: Vector2) {
+    pub fn draw(
+        &mut self,
+        drawing: &mut RaylibDrawHandle<'_>,
+        thread: &RaylibThread,
+        mouse: Vector2,
+    ) {
+        let width = drawing.get_screen_width();
+        let height = drawing.get_screen_height();
+        if let Some(mut canvas) = self.canvas.take() {
+            {
+                let mut target = drawing.begin_texture_mode(thread, &mut canvas);
+                target.clear_background(Color::BLANK);
+                let mut scaled = target.begin_mode2D(Camera2D {
+                    zoom: 2.0,
+                    ..Default::default()
+                });
+                // Preserve coverage in alpha instead of multiplying it by itself.
+                unsafe {
+                    raylib::ffi::rlSetBlendFactorsSeparate(
+                        raylib::ffi::RL_SRC_ALPHA as i32,
+                        raylib::ffi::RL_ONE_MINUS_SRC_ALPHA as i32,
+                        raylib::ffi::RL_ONE as i32,
+                        raylib::ffi::RL_ONE_MINUS_SRC_ALPHA as i32,
+                        raylib::ffi::RL_FUNC_ADD as i32,
+                        raylib::ffi::RL_FUNC_ADD as i32,
+                    );
+                }
+                let mut blended = scaled.begin_blend_mode(BlendMode::BLEND_CUSTOM_SEPARATE);
+                self.draw_content(&mut blended, mouse, width, height, 2.0);
+            }
+            // The transparent offscreen target already contains premultiplied RGB.
+            let mut composite = drawing.begin_blend_mode(BlendMode::BLEND_ALPHA_PREMULTIPLY);
+            composite.draw_texture_pro(
+                canvas.texture(),
+                Rectangle::new(
+                    0.0,
+                    canvas.texture().height() as f32 - height as f32 * 2.0,
+                    width as f32 * 2.0,
+                    -(height as f32 * 2.0),
+                ),
+                Rectangle::new(0.0, 0.0, width as f32, height as f32),
+                Vector2::zero(),
+                0.0,
+                Color::WHITE,
+            );
+            self.canvas = Some(canvas);
+        } else {
+            self.draw_content(drawing, mouse, width, height, 1.0);
+        }
+    }
+
+    fn draw_content(
+        &mut self,
+        drawing: &mut impl RaylibDraw,
+        mouse: Vector2,
+        viewport_width: i32,
+        viewport_height: i32,
+        scale: f32,
+    ) {
         let reduced = self
             .scene
             .as_ref()
@@ -282,12 +362,8 @@ impl Renderer {
         } else {
             compact_geometry(self.scene.as_ref())
         };
-        geometry.0 = geometry
-            .0
-            .min((drawing.get_screen_width() - 40).max(1) as f32);
-        geometry.1 = geometry
-            .1
-            .min((drawing.get_screen_height() - 40).max(1) as f32);
+        geometry.0 = geometry.0.min((viewport_width - 40).max(1) as f32);
+        geometry.1 = geometry.1.min((viewport_height - 40).max(1) as f32);
         let hidden = self.visibility == Visibility::Hidden;
         let target = if hidden {
             [
@@ -320,15 +396,15 @@ impl Renderer {
                 );
             }
         }
-        self.shape[0] = self.shape[0].clamp(1.0, (drawing.get_screen_width() - 40).max(1) as f32);
-        self.shape[1] = self.shape[1].clamp(1.0, (drawing.get_screen_height() - 40).max(1) as f32);
+        self.shape[0] = self.shape[0].clamp(1.0, (viewport_width - 40).max(1) as f32);
+        self.shape[1] = self.shape[1].clamp(1.0, (viewport_height - 40).max(1) as f32);
         self.shape[2] = self.shape[2].clamp(0.0, self.shape[0].min(self.shape[1]) / 2.0);
         self.shape[5] = self.shape[5].clamp(0.0, 1.0);
         if self.shape[5] == 0.0 {
             return;
         }
         let [width, height, radius, padding_x, padding_y, opacity, y] = self.shape;
-        let x = (drawing.get_screen_width() as f32 - width) * 0.5;
+        let x = (viewport_width as f32 - width) * 0.5;
         draw_shadow(
             drawing,
             Rectangle::new(x, y, width, height),
@@ -348,16 +424,16 @@ impl Renderer {
         };
         // Lay out at the destination size so text never scales or reflows with the spring.
         let bounds = Rectangle::new(
-            (drawing.get_screen_width() as f32 - geometry.0) * 0.5 + geometry.3,
+            (viewport_width as f32 - geometry.0) * 0.5 + geometry.3,
             y + geometry.4,
             geometry.0 - geometry.3 * 2.0,
             geometry.1 - geometry.4 * 2.0,
         );
         let mut clip = drawing.begin_scissor_mode(
-            (x + padding_x) as i32,
-            (y + padding_y) as i32,
-            (width - 2.0 * padding_x).max(0.0) as i32,
-            (height - 2.0 * padding_y).max(0.0) as i32,
+            ((x + padding_x) * scale) as i32,
+            ((y + padding_y) * scale) as i32,
+            ((width - 2.0 * padding_x).max(0.0) * scale) as i32,
+            ((height - 2.0 * padding_y).max(0.0) * scale) as i32,
         );
         if let Some((previous, visibility, began)) = self.outgoing.clone() {
             let alpha = if reduced {
@@ -840,7 +916,7 @@ fn measure_leaf(
                 return Size { width, height };
             }
             if let Some(font) = node["_font"].as_str().and_then(|name| fonts.get(name)) {
-                let draw_size = size * (2478.0 / 2048.0);
+                let draw_size = size * (2288.0 / 2048.0);
                 let line_height = size * number(node, "_line_height", 1.2);
                 let lines = if node["_single_line"] == true {
                     vec![text.clone()]
@@ -876,9 +952,9 @@ fn measure_leaf(
             let layout = pango::Layout::new(pango);
             layout.set_text(&text);
             let mut font = pango::FontDescription::new();
-            font.set_family("Inter");
+            font.set_family("Liberation Sans");
             if node["_font"] == "semibold" {
-                font.set_weight(pango::Weight::Semibold);
+                font.set_weight(pango::Weight::Bold);
             }
             font.set_absolute_size(f64::from(size) * f64::from(pango::SCALE));
             layout.set_font_description(Some(&font));
@@ -971,8 +1047,8 @@ fn draw_node(
             let font_name = node.and_then(|n| n["_font"].as_str()).unwrap_or(font_name);
             if let Some(font) = fonts.get(font_name) {
                 let line_height = size * node.map_or(1.2, |n| number(n, "_line_height", 1.2));
-                // shortcut: calibrated to bundled Inter metrics; recalibrate if replacing the text fonts.
-                let draw_size = size * (2478.0 / 2048.0);
+                // shortcut: calibrated to bundled Liberation Sans metrics; recalibrate if replacing the text fonts.
+                let draw_size = size * (2288.0 / 2048.0);
                 let lines = if node.is_some_and(|n| n["_single_line"] == true) {
                     let mut label = text.clone();
                     if font.measure_text(&label, draw_size, 0.0).x > rect.width + 0.5 {
@@ -1590,7 +1666,7 @@ fn gap_value(value: Option<&Value>) -> f32 {
         _ => 12.0,
     }
 }
-fn draw_shadow(d: &mut RaylibDrawHandle<'_>, rect: Rectangle, radius: f32, opacity: f32) {
+fn draw_shadow(d: &mut impl RaylibDraw, rect: Rectangle, radius: f32, opacity: f32) {
     for step in (1..=16).rev() {
         let grow = step as f32;
         let shadow = Rectangle::new(
@@ -1744,6 +1820,7 @@ mod tests {
             .msaa_4x()
             .build();
         window.set_target_fps(60);
+        let mut renderer = super::Renderer::new(std::path::PathBuf::from("assets"));
         for viewport_width in [472, 360] {
             window.set_window_size(viewport_width, 580);
             for scene in scenes.clone() {
@@ -1754,7 +1831,6 @@ mod tests {
                     format!("{name}-narrow")
                 };
                 let expanded = scene["surface"] == "expanded";
-                let mut renderer = super::Renderer::new(std::path::PathBuf::from("assets"));
                 renderer.set_scene(scene).unwrap();
                 renderer.set_visibility(if expanded {
                     super::Visibility::Expanded
@@ -1765,7 +1841,7 @@ mod tests {
                 for _ in 0..3 {
                     let mut d = window.begin_drawing(&thread);
                     d.clear_background(Color::new(245, 245, 247, 255));
-                    renderer.draw(&mut d, Vector2::new(-1.0, -1.0));
+                    renderer.draw(&mut d, &thread, Vector2::new(-1.0, -1.0));
                 }
                 for hit in &renderer.hits {
                     assert!(
@@ -1787,9 +1863,21 @@ mod tests {
                     "{name}: surface must be opaque black"
                 );
                 assert!(
-                    screenshot.get_color(viewport_width / 2, 10).r > 220,
+                    (200..245).contains(&screenshot.get_color(viewport_width / 2, 18).r),
                     "{name}: shadow must remain translucent"
                 );
+                if name == "calendar" {
+                    let has_coverage = (235..247).any(|y| {
+                        (110..132).any(|x| {
+                            let pixel = screenshot.get_color(x, y);
+                            pixel.r == 0 && pixel.b > 0 && pixel.b < 227
+                        })
+                    });
+                    assert!(
+                        has_coverage,
+                        "calendar: selected circle must have antialiased edges"
+                    );
+                }
                 screenshot.export_image(&format!("{output}/{name}.png"));
                 assert!(std::path::Path::new(&format!("{output}/{name}.png")).is_file());
             }

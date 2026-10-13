@@ -405,7 +405,7 @@ fn run() -> Result<()> {
         renderer.prepare(&mut window, &thread);
         let mut drawing = window.begin_drawing(&thread);
         drawing.clear_background(Color::BLANK);
-        renderer.draw(&mut drawing, mouse);
+        renderer.draw(&mut drawing, &thread, mouse);
         drop(drawing);
         std::thread::sleep(Duration::from_micros(16_667).saturating_sub(frame_started.elapsed()));
     }

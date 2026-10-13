@@ -3,9 +3,9 @@ local platform = require("platform")
 return function(api, supplied)
   if supplied and next(supplied) ~= nil then error("power-menu has no options") end
   local choices = {
-    { id = "lock", label = "Verrouiller", icon = "lock" },
-    { id = "reboot", label = "Redémarrer", icon = "reboot" },
-    { id = "power-off", label = "Éteindre", icon = "power-off" },
+    { id = "lock", label = "Lock", icon = "lock" },
+    { id = "reboot", label = "Reboot", icon = "reboot" },
+    { id = "power-off", label = "Power off", icon = "power-off" },
   }
   local selected, confirmation, failure = 1, nil, nil
   local publish
@@ -28,7 +28,7 @@ return function(api, supplied)
     if called and result and result.timed_out then detail = "timed out" end
     if detail == "" then detail = "exited with status " .. tostring(result.status) end
     api.log("error", label .. " failed: " .. detail:sub(1, 512))
-    selected, confirmation, failure = 1, nil, "Action impossible. Réessayez."
+    selected, confirmation, failure = 1, nil, "Action failed. Try again."
     publish()
     return false
   end
@@ -51,13 +51,13 @@ return function(api, supplied)
   end
 
   local function confirmation_view(kind)
-    local label = kind == "reboot" and "Redémarrer" or "Éteindre"
+    local label = kind == "reboot" and "Reboot" or "Power off"
     return api.ui.column { gap = "normal", children = {
-      api.ui.text { value = label .. " l’ordinateur ?", role = "title" },
-      api.ui.text { value = "Les applications ouvertes seront fermées.", role = "muted" },
+      api.ui.text { value = label .. " the computer?", role = "title" },
+      api.ui.text { value = "Any unsaved work will be lost.", role = "muted" },
       api.ui.row { gap = "normal", children = {
-        api.ui.button { action_id = "cancel", accessible_label = "Annuler", style = "quiet", focused = selected == 1,
-          content = api.ui.text { value = "Annuler", role = "button" } },
+        api.ui.button { action_id = "cancel", accessible_label = "Cancel", style = "quiet", focused = selected == 1,
+          content = api.ui.text { value = "Cancel", role = "button" } },
         api.ui.button { action_id = "confirm-" .. kind, accessible_label = label, style = "danger", focused = selected == 2,
           content = api.ui.text { value = label, role = "button" } },
       } },
@@ -67,7 +67,7 @@ return function(api, supplied)
   local function failure_view()
     return api.ui.column { alignment = "start", gap = "small", children = {
       api.ui.text { value = failure, role = "body" },
-      choice("back", "Retour", "chevron-left", true),
+      choice("back", "Back", "chevron-left", true),
     } }
   end
 

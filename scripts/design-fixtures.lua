@@ -8,7 +8,7 @@ local api = { ui = {}, timer = { after=function() end, defer=function(f) f() end
   dismiss=function() end, overlay={close=function() end}, log=function() end,
   state={load=function(_, default) return default end, save=function() end},
   time={ now=function() return { year=2026,month=10,day=13,second=0 } end,
-    format=function(_, pattern) return ({ ["%H:%M"]="14:32", ["%a %d %b"]="mar. 13 oct.", ["%B"]="Octobre", ["%A %d %B"]="Mardi 13 octobre" })[pattern] or "13 octobre" end },
+    format=function(_, pattern) return ({ ["%H:%M"]="14:32", ["%a %d %b"]="Tue 13 Oct", ["%B"]="October", ["%A %d %B"]="Tuesday 13 October" })[pattern] or "13 October" end },
   process={ run=function(argv) return {ok=true, output=argv[2]=="get-sink-volume" and " / 60%" or "Mute: no"} end },
   dbus={ proxy=function() return { get=function(_, name) return battery[name] end } end,
     service=function(spec) methods=spec.methods return {signal=function() end} end },
@@ -51,12 +51,12 @@ for _, level in ipairs {20,5} do
 end
 local notifications=require("modules.notifications.notifications")(api,{})
 notifications.start()
-methods.Notify("Fichiers",0,"","Téléchargement terminé","L’archive gisland.tar.gz est prête dans Téléchargements.",{"open","Ouvrir le dossier"},{},0)
+methods.Notify("Files",0,"","Download complete","The gisland.tar.gz archive is ready in Downloads.",{"open","Open folder"},{},0)
 capture("notification", "expanded")
 capture("notification-compact", "compact")
 notifications.actions["show-more"]()
 capture("history", "expanded")
-local short_id=methods.Notify("Terminal",0,"","Commande terminée","",{},{},0)
+local short_id=methods.Notify("Terminal",0,"","Command complete","",{},{},0)
 capture("notification-small", "expanded", publications["notification-"..short_id])
 local empty=require("modules.notifications.notifications")(api,{})
 empty.actions["show-more"]()

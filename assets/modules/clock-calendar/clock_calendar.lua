@@ -1,6 +1,6 @@
 local platform = require("platform")
-local defaults = { locale = nil, timezone = nil, week_start = "monday" }
-local weekday_names = { "Di", "Lu", "Ma", "Me", "Je", "Ve", "Sa" }
+local defaults = { locale = "en_US", timezone = nil, week_start = "monday" }
+local weekday_names = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" }
 local function leap(year) return year % 4 == 0 and (year % 100 ~= 0 or year % 400 == 0) end
 local function days_in_month(year, month)
   if month == 2 then return leap(year) and 29 or 28 end
@@ -59,21 +59,21 @@ return function(api, supplied)
     end
     local expanded = api.ui.column { gap = "large", alignment = "stretch", children = {
       api.ui.row { gap = "small", children = {
-        api.ui.button { action_id = "previous-month", accessible_label = "Mois précédent", style = "icon", content = api.ui.icon { name = "chevron-left" } },
+        api.ui.button { action_id = "previous-month", accessible_label = "Previous month", style = "icon", content = api.ui.icon { name = "chevron-left" } },
         api.ui.spacer { flexible = true },
         api.ui.column { gap = "none", children = {
           api.ui.text { value = api.time.format({ year = displayed_year, month = displayed_month, day = 1, source = current }, "%B"):gsub("^%l", string.upper), role = "calendar-month" },
           api.ui.text { value = tostring(displayed_year), role = "muted" },
         } },
         api.ui.spacer { flexible = true },
-        api.ui.button { action_id = "next-month", accessible_label = "Mois suivant", style = "icon", content = api.ui.icon { name = "chevron-right" } },
+        api.ui.button { action_id = "next-month", accessible_label = "Next month", style = "icon", content = api.ui.icon { name = "chevron-right" } },
       } },
       api.ui.row { gap = "xsmall", children = columns },
       api.ui.divider {},
       api.ui.row { gap = "small", children = {
         api.ui.text { value = api.time.format({ year = selected.year, month = selected.month, day = selected.day, source = current }, "%A %d %B"):gsub("^%l", string.upper), role = "muted" },
         api.ui.spacer { flexible = true },
-        api.ui.button { action_id = "today", accessible_label = "Aujourd’hui", style = "link", content = api.ui.text { value = "Aujourd’hui", role = "accent" } },
+        api.ui.button { action_id = "today", accessible_label = "Today", style = "link", content = api.ui.text { value = "Today", role = "accent" } },
       } },
     } }
     local spec = { context_id = "clock", priority = 10, views = {

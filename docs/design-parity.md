@@ -63,9 +63,23 @@ restart, lock or power-off command was executed on the desktop.
 
 ![HTML reference and native renderer](design-comparison.png)
 
-The reference uses an SF/Helvetica/Arial font stack. The native application keeps
-its bundled, licensed Inter fonts, calibrated to CSS em sizes; glyph shapes,
-font weight and antialiasing therefore differ. This is a visual port, not a
-pixel-identical browser rendering. Screenshot comparisons are manual, with
-geometric assertions in the native test. The web board's mobile/tablet navigation
-is not part of this desktop product. No local service installation was performed.
+The reference declares an SF/Helvetica/Arial font stack. Chromium on the reference
+Linux host resolves it to Liberation Sans (verified through its platform-font
+API). The native application bundles Liberation Sans regular and bold with their
+SIL OFL license and calibrates text measurements to its CSS em metrics.
+Application labels, accessibility labels and fixtures remain English; the
+unaltered reference images retain the French wording supplied in the archive.
+
+The renderer supersamples at twice the width and height, then downsamples with
+bilinear filtering. Text uses a 128 px atlas with trilinear mipmap filtering.
+This smooths shapes and text even where requesting MSAA does
+not produce covered edge pixels. The offscreen canvas is reused until it needs
+to grow; separate alpha blending preserves translucent shadows and fades.
+This costs four times the offscreen pixels plus one compositing pass. If the
+canvas cannot be allocated, drawing falls back to the direct renderer.
+
+The graphical test checks partial coverage at the selected calendar circle's
+edge, as well as opaque surfaces and visible translucent shadows. Screenshot
+comparisons are otherwise manual; this is not pixel-identical browser rendering.
+The web board's mobile/tablet navigation is not part of this desktop product.
+No local service installation was performed.

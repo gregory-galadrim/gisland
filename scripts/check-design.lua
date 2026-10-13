@@ -4,7 +4,7 @@ local api = { ui = {}, timer = { after = function() end, defer = function(f) f()
   publish = function(spec) published = spec end, dismiss = function() end,
   overlay = { close = function() end },
   time = { now = function() return { year=2026, month=10, day=13, second=0 } end,
-    format = function(_, pattern) return ({ ["%H:%M"]="09:41", ["%a %d %b"]="mar. 13 oct.", ["%B"]="octobre", ["%A %d %B"]="mardi 13 octobre" })[pattern] or "13 octobre" end },
+    format = function(_, pattern) return ({ ["%H:%M"]="09:41", ["%a %d %b"]="Tue 13 Oct", ["%B"]="October", ["%A %d %B"]="Tuesday 13 October" })[pattern] or "13 October" end },
   process = { run = function(argv)
     return { ok=true, output=argv[2] == "get-sink-volume" and " / 65%" or "Mute: no" }
   end },

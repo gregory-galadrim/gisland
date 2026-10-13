@@ -56,20 +56,20 @@ return function(api, supplied)
   local function snapshot(reading)
     local percentage = math.max(0, math.min(reading.percentage, 100))
     local estimate = duration(reading.on_battery and reading.time_to_empty or reading.time_to_full)
-    local state_text = reading.state == "charging" and "Charge" or
-      reading.state == "fully-charged" and "Chargée" or
-      reading.on_battery and "Sur batterie" or "Secteur"
+    local state_text = reading.state == "charging" and "Charging" or
+      reading.state == "fully-charged" and "Fully charged" or
+      reading.on_battery and "On battery" or "Plugged in"
     local health = "—"
     if reading.energy_full > 0 and reading.energy_full_design > 0 then
       health = tostring(round(reading.energy_full / reading.energy_full_design * 100)) .. " %"
     end
-    local power = reading.energy_rate > 0 and string.format("%.1f W", reading.energy_rate):gsub("%.", ",") or "—"
+    local power = reading.energy_rate > 0 and string.format("%.1f W", reading.energy_rate) or "—"
     return {
       level = percentage / 100, percent_text = tostring(round(percentage)) .. " %",
       semantic_state = percentage > options.yellow_percent and "success" or
         percentage > options.red_percent and "warning" or "error",
-      estimate_compact = estimate or "Calcul…", state_text = state_text,
-      estimate_detail = estimate and (estimate .. (reading.on_battery and " restantes" or " avant charge complète")) or "—",
+      estimate_compact = estimate or "Calculating…", state_text = state_text,
+      estimate_detail = estimate and (estimate .. (reading.on_battery and " remaining" or " until fully charged")) or "—",
       health_text = health, power_text = power,
     }
   end
@@ -92,10 +92,10 @@ return function(api, supplied)
       return ui.row { gap = "normal", children = {
         ui.icon { name = "warning", state = value.semantic_state, size = 24 },
         ui.column { alignment = "start", grow = 1, gap = "xsmall", children = {
-          ui.text { value = "Batterie faible · " .. value.percent_text, role = "body" },
-          ui.text { value = "Branchez votre ordinateur.", role = "muted" },
+          ui.text { value = "Low battery · " .. value.percent_text, role = "body" },
+          ui.text { value = "Plug in your computer.", role = "muted" },
         } },
-        ui.button { action_id = "dismiss-alert", accessible_label = "Fermer l’alerte", style = "icon", content = ui.icon { name = "close" } },
+        ui.button { action_id = "dismiss-alert", accessible_label = "Dismiss battery alert", style = "icon", content = ui.icon { name = "close" } },
       } }
     end
     return ui.column { gap = "normal", alignment = "stretch", children = {
@@ -107,7 +107,7 @@ return function(api, supplied)
         } },
       } },
       ui.spacer { size = 0 },
-      ui.divider {}, row("Autonomie", value.estimate_compact), row("Santé", value.health_text), row("Puissance", value.power_text),
+      ui.divider {}, row("Time remaining", value.estimate_compact), row("Health", value.health_text), row("Power", value.power_text),
     } }
   end
 

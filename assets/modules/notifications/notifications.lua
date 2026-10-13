@@ -144,9 +144,9 @@ return function(api, supplied)
     local header = {
       app_resource and ui.image { resource_id = "app-image", role = "notification-header-icon", accessible_label = notification.app_name } or ui.icon { name = "notification", size = 40, style = "app-symbol" },
       ui.column { alignment = "start", gap = "small", grow = 1, children = {
-        text(notification.app_name ~= "" and notification.app_name or "Application", "button"), text("À l’instant", "caption"),
+        text(notification.app_name ~= "" and notification.app_name or "Application", "button"), text("Just now", "caption"),
       } },
-      ui.button { action_id = prefix .. "close", accessible_label = "Fermer la notification", style = "icon", content = ui.icon { name = "close" } },
+      ui.button { action_id = prefix .. "close", accessible_label = "Close notification", style = "icon", content = ui.icon { name = "close" } },
     }
     local top = { ui.row { gap = "normal", children = array(header) } }
     local message = {}
@@ -173,7 +173,7 @@ return function(api, supplied)
         routing[id] = { "dbus", key }; buttons[#buttons + 1] = ui.button { action_id = id, accessible_label = label, grow = 1, style = action_index == 1 and "primary" or "quiet", content = text(label, "button") }
       end
     end
-    buttons[#buttons + 1] = ui.button { action_id = prefix .. "close", accessible_label = "Plus tard", grow = 1, style = "quiet", content = text("Plus tard", "button") }
+    buttons[#buttons + 1] = ui.button { action_id = prefix .. "close", accessible_label = "Later", grow = 1, style = "quiet", content = text("Later", "button") }
     if #buttons > 0 then top[#top + 1] = ui.row { gap = "normal", children = array(buttons) } end
     local expanded = ui.column { alignment = "stretch", gap = "large", children = array(top) }
     if default then expanded = ui.action_region { action_id = default, accessible_label = "Open notification", content = expanded } end
@@ -248,22 +248,22 @@ return function(api, supplied)
 
   local function age(value)
     local elapsed = math.max(0, os.time() - value)
-    if elapsed < 60 then return "maintenant" end
+    if elapsed < 60 then return "now" end
     if elapsed < 3600 then return tostring(math.floor(elapsed / 60)) .. " min" end
     if elapsed < 86400 then return tostring(math.floor(elapsed / 3600)) .. " h" end
-    return tostring(math.floor(elapsed / 86400)) .. " j"
+    return tostring(math.floor(elapsed / 86400)) .. " d"
   end
   function history_publication()
     local children = { ui.row { children = {
-      ui.column { alignment = "start", gap = "none", grow = 1, children = { text("Notifications récentes", "compact-primary"), text(tostring(#history) .. " notifications", "caption") } },
-      ui.button { action_id = "close-history", accessible_label = "Fermer l’historique", style = "icon", content = ui.icon { name = "close" } },
+      ui.column { alignment = "start", gap = "none", grow = 1, children = { text("Recent notifications", "compact-primary"), text(tostring(#history) .. " notifications", "caption") } },
+      ui.button { action_id = "close-history", accessible_label = "Close history", style = "icon", content = ui.icon { name = "close" } },
     } } }
     local count = 0
     for _, record in ipairs(history) do
       if not hidden[record.sequence] and count < visible_count then
         local content = record.summary ~= "" and record.summary or record.body
         children[#children + 1] = ui.divider {}
-        children[#children + 1] = ui.action_region { action_id = "history:" .. tostring(session) .. ":hide:" .. tostring(record.sequence), accessible_label = "Masquer " .. content,
+        children[#children + 1] = ui.action_region { action_id = "history:" .. tostring(session) .. ":hide:" .. tostring(record.sequence), accessible_label = "Hide " .. content,
           content = ui.row { gap = "normal", children = {
             ui.icon { name = "notification", size = 20 },
             ui.column { alignment = "start", gap = "xsmall", grow = 1, children = {
@@ -275,11 +275,11 @@ return function(api, supplied)
       end
     end
     if count == 0 then
-      children[#children + 1] = text("Aucune notification", "body")
-      children[#children + 1] = text("Vous êtes à jour.", "muted")
+      children[#children + 1] = text("No notifications", "body")
+      children[#children + 1] = text("You're all caught up.", "muted")
     end
     if count < #history and visible_count < options.history_visible_limit then
-      children[#children + 1] = ui.button { action_id = "show-more", accessible_label = "Voir une notification plus ancienne", style = "link", content = text("Voir une notification plus ancienne", "accent") }
+      children[#children + 1] = ui.button { action_id = "show-more", accessible_label = "Show an older notification", style = "link", content = text("Show an older notification", "accent") }
     end
     return { context_id = "history", priority = 100, presentation = { expanded_style = "history", expanded_height = math.min(520, count == 0 and 180 or 148 + count * 76) }, views = { expanded = ui.column { alignment = "stretch", gap = "normal", children = children } } }
   end
