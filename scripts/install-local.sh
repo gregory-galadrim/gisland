@@ -15,13 +15,14 @@ patchelf --add-rpath "${LD_LIBRARY_PATH%%:*}:/run/opengl-driver/lib" "$prefix/bi
 ln -sfn gisland "$prefix/bin/gislandctl"
 rm -f "$prefix/bin/gisland-lua-host"
 rm -rf "$prefix/share/gisland"
-install -d "$prefix/share/gisland/modules" "$prefix/share/gisland/fonts"
+install -d "$prefix/share/gisland/modules" "$prefix/share/gisland/fonts" "$prefix/share/gisland/icons"
 install -m644 assets/*.lua "$prefix/share/gisland/"
 for module in assets/modules/*; do
   name=${module##*/}
   install -d "$prefix/share/gisland/modules/$name"
   find "$module" -maxdepth 1 -type f -name '*.lua' -exec install -m644 '{}' "$prefix/share/gisland/modules/$name/" \;
 done
+install -m644 assets/icons/*.svg "$prefix/share/gisland/icons/"
 install -m644 assets/fonts/*.ttf assets/fonts/*.otf assets/fonts/LICENSE-* "$prefix/share/gisland/fonts/"
 install -Dm644 packaging/gisland.service "$HOME/.config/systemd/user/gisland.service"
 

@@ -39,7 +39,9 @@ end
 
 local instance = assert(dofile("assets/modules/power-menu/power_menu.lua"))(api, {})
 local actions = activate(instance)
-for _, id in ipairs { "lock", "sleep", "reboot", "power-off" } do assert(actions[id], "missing " .. id) end
+assert(not instance.actions["confirm-power-off"](), "unconfirmed power-off must be rejected")
+expect_commands()
+for _, id in ipairs { "lock", "reboot", "power-off" } do assert(actions[id], "missing " .. id) end
 
 instance.actions["power-off"]()
 expect_commands()
@@ -59,7 +61,6 @@ expect_commands("systemctl\0reboot")
 
 activate(instance)
 instance.input("down")
-instance.input("down")
 instance.input("enter")
 expect_commands()
 assert(action_ids(published.views.expanded)["confirm-reboot"])
@@ -68,7 +69,6 @@ instance.input("enter")
 expect_commands("systemctl\0reboot")
 
 activate(instance)
-instance.input("down")
 instance.input("down")
 instance.input("enter")
 instance.input("escape")

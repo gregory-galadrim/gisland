@@ -25,19 +25,19 @@ pub struct HitRegion {
 pub struct Renderer {
     scene: Option<Value>,
     changed: Instant,
+    outgoing: Option<(Value, Visibility, Instant)>,
     meter_changed: Instant,
     meter_from: f32,
     meter_target: Option<f32>,
-    geometry_changed: Instant,
-    compact_from: (f32, f32, f32, f32, f32),
-    expanded_from: (f32, f32, f32, f32, f32),
     visibility: Visibility,
-    visibility_target: f32,
-    visibility_velocity: f32,
+    shape: [f32; 7],
+    velocity: [f32; 7],
+    motion_duration: f32,
+    motion_bounce: f32,
     last_frame: Instant,
-    progress: f32,
     pango: pango::Context,
     pub hits: Vec<HitRegion>,
+    keyboard_action: Option<String>,
     textures: HashMap<String, Texture2D>,
     fonts: HashMap<String, Font>,
     font_characters: String,
@@ -49,19 +49,19 @@ impl Renderer {
         Self {
             scene: None,
             changed: Instant::now(),
+            outgoing: None,
             meter_changed: Instant::now(),
             meter_from: 0.0,
             meter_target: None,
-            geometry_changed: Instant::now(),
-            compact_from: (230.0, 32.0, 16.0, 14.0, 4.0),
-            expanded_from: (432.0, 344.0, 30.0, 24.0, 24.0),
-            visibility: Visibility::Compact,
-            visibility_target: 0.0,
-            visibility_velocity: 0.0,
+            visibility: Visibility::Hidden,
+            shape: [230.0, 32.0, 16.0, 20.0, 8.0, 0.0, 16.0],
+            velocity: [0.0; 7],
+            motion_duration: 0.38,
+            motion_bounce: 0.24,
             last_frame: Instant::now(),
-            progress: 0.0,
             pango: pangocairo::FontMap::default().create_context(),
             hits: Vec::new(),
+            keyboard_action: None,
             textures: HashMap::new(),
             fonts: HashMap::new(),
             font_characters: String::new(),
@@ -69,8 +69,14 @@ impl Renderer {
             measurements: HashMap::new(),
         }
     }
-    pub fn set_scene(&mut self, scene: Value) -> Result<()> {
+    pub fn set_scene(&mut self, mut scene: Value) -> Result<()> {
         validate_scene(&scene)?;
+        let theme = scene["theme"].clone();
+        for surface in ["compact", "expanded"] {
+            if let Some(node) = scene.get_mut(surface).filter(|node| !node.is_null()) {
+                resolve_theme(node, &theme);
+            }
+        }
         if let Some((target, declared_from)) = find_progress(&scene) {
             let speed = self
                 .scene
@@ -83,7 +89,7 @@ impl Renderer {
                     self.meter_from,
                     previous,
                     ease_out(
-                        (self.meter_changed.elapsed().as_secs_f32() * speed / 0.27).clamp(0.0, 1.0),
+                        (self.meter_changed.elapsed().as_secs_f32() * speed / 0.20).clamp(0.0, 1.0),
                     ),
                 )
             });
@@ -99,35 +105,18 @@ impl Renderer {
             current.get("compact_context") != scene.get("compact_context")
                 || current.get("expanded_context") != scene.get("expanded_context")
         });
-        if context_changed {
-            let speed = self
-                .scene
-                .as_ref()
-                .and_then(|value| value.pointer("/interaction/animation_speed"))
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0) as f32;
-            let progress = ease_in_out(
-                (self.geometry_changed.elapsed().as_secs_f32() * speed / 0.325).clamp(0.0, 1.0),
-            );
-            self.compact_from = if self.progress >= 0.999 {
-                compact_geometry(Some(&scene))
-            } else {
-                interpolate_compact(
-                    self.compact_from,
-                    compact_geometry(self.scene.as_ref()),
-                    progress,
-                )
-            };
-            self.expanded_from = if self.progress <= 0.001 {
-                expanded_geometry(Some(&scene))
-            } else {
-                interpolate_compact(
-                    self.expanded_from,
-                    expanded_geometry(self.scene.as_ref()),
-                    progress,
-                )
-            };
-            self.geometry_changed = Instant::now();
+        let geometry_changed = compact_geometry(self.scene.as_ref())
+            != compact_geometry(Some(&scene))
+            || expanded_geometry(self.scene.as_ref()) != expanded_geometry(Some(&scene));
+        if context_changed || geometry_changed {
+            if self.outgoing.is_none()
+                && let Some(previous) = self.scene.as_ref()
+            {
+                self.outgoing = Some((previous.clone(), self.visibility, Instant::now()));
+            }
+            self.motion_duration =
+                number(&scene["theme"]["animation"], "context_change_ms", 320.0) / 1000.0;
+            self.motion_bounce = number(&scene["theme"]["animation"], "swap_bounce", 0.20);
         }
         let declared_transition =
             ["compact_transitions", "expanded_transitions"]
@@ -138,6 +127,9 @@ impl Renderer {
                         .and_then(Value::as_object)
                         .is_some_and(|transitions| !transitions.is_empty())
                 });
+        if context_changed {
+            self.keyboard_action = None;
+        }
         if context_changed || declared_transition {
             self.changed = Instant::now();
         }
@@ -146,51 +138,71 @@ impl Renderer {
         Ok(())
     }
     pub fn set_visibility(&mut self, value: Visibility) {
-        self.visibility = value;
-        self.visibility_target = if value == Visibility::Expanded {
-            1.0
-        } else {
-            0.0
-        };
-        if value == Visibility::Hidden {
-            self.progress = 0.0;
-            self.visibility_velocity = 0.0;
+        if value == self.visibility {
+            return;
         }
+        let animation = self
+            .scene
+            .as_ref()
+            .map(|s| &s["theme"]["animation"])
+            .unwrap_or(&Value::Null);
+        let (key, duration, bounce) = if value == Visibility::Hidden {
+            ("close_ms", 240.0, 0.08)
+        } else if self.visibility == Visibility::Hidden {
+            ("open_ms", 380.0, 0.24)
+        } else if value == Visibility::Expanded {
+            ("compact_to_expanded_ms", 400.0, 0.24)
+        } else {
+            ("collapse_ms", 260.0, 0.08)
+        };
+        self.motion_duration = number(animation, key, duration) / 1000.0;
+        self.motion_bounce = number(
+            animation,
+            if bounce == 0.08 {
+                "exit_bounce"
+            } else {
+                "bounce"
+            },
+            bounce,
+        );
+        if self.visibility != Visibility::Hidden
+            && let Some(scene) = self.scene.as_ref()
+        {
+            self.outgoing = Some((scene.clone(), self.visibility, Instant::now()));
+        }
+        self.keyboard_action = None;
+        self.visibility = value;
+        self.changed = Instant::now();
     }
     pub fn extent(&self) -> (i32, i32) {
-        let reduced = self
-            .scene
-            .as_ref()
-            .and_then(|scene| scene.pointer("/interaction/reduced_motion"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let speed = self
-            .scene
-            .as_ref()
-            .and_then(|scene| scene.pointer("/interaction/animation_speed"))
-            .and_then(Value::as_f64)
-            .unwrap_or(1.0) as f32;
-        let geometry_progress = if reduced {
-            1.0
-        } else {
-            ease_in_out(
-                (self.geometry_changed.elapsed().as_secs_f32() * speed / 0.325).clamp(0.0, 1.0),
-            )
-        };
-        let compact = interpolate_compact(
-            self.compact_from,
-            compact_geometry(self.scene.as_ref()),
-            geometry_progress,
-        );
-        let expanded = interpolate_compact(
-            self.expanded_from,
-            expanded_geometry(self.scene.as_ref()),
-            geometry_progress,
-        );
         (
-            (lerp(compact.0, expanded.0, self.progress) + 40.0) as i32,
-            (lerp(compact.1, expanded.1, self.progress) + 40.0) as i32,
+            (self.shape[0] + 40.0).ceil() as i32,
+            (self.shape[1] + 40.0).ceil() as i32,
         )
+    }
+
+    pub fn focus_next(&mut self, backwards: bool) {
+        if self.hits.is_empty() {
+            self.keyboard_action = None;
+            return;
+        }
+        let current = self
+            .keyboard_action
+            .as_ref()
+            .and_then(|action| self.hits.iter().position(|hit| &hit.action == action));
+        let next = match current {
+            Some(index) if backwards => (index + self.hits.len() - 1) % self.hits.len(),
+            Some(index) => (index + 1) % self.hits.len(),
+            None if backwards => self.hits.len() - 1,
+            None => 0,
+        };
+        self.keyboard_action = Some(self.hits[next].action.clone());
+    }
+    pub fn focused_hit(&self) -> Option<HitRegion> {
+        self.hits
+            .iter()
+            .find(|hit| self.keyboard_action.as_ref() == Some(&hit.action))
+            .cloned()
     }
 
     pub fn prepare(&mut self, window: &mut RaylibHandle, thread: &RaylibThread) {
@@ -233,7 +245,13 @@ impl Renderer {
             if self.textures.contains_key(&source) {
                 continue;
             }
-            let path = source.strip_prefix("file://").unwrap_or(&source);
+            let raw = Path::new(source.strip_prefix("file://").unwrap_or(&source));
+            let full_path = if raw.is_absolute() {
+                raw.to_owned()
+            } else {
+                self.asset_root.join(raw)
+            };
+            let path = full_path.to_str().unwrap_or("");
             if Path::new(path).is_file()
                 && let Some(texture) = texture_from_path(window, thread, path)
             {
@@ -259,80 +277,157 @@ impl Renderer {
         let delta = now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
         self.hits.clear();
-        if self.visibility == Visibility::Hidden {
+        let mut geometry = if self.visibility == Visibility::Expanded {
+            expanded_geometry(self.scene.as_ref())
+        } else {
+            compact_geometry(self.scene.as_ref())
+        };
+        geometry.0 = geometry
+            .0
+            .min((drawing.get_screen_width() - 40).max(1) as f32);
+        geometry.1 = geometry
+            .1
+            .min((drawing.get_screen_height() - 40).max(1) as f32);
+        let hidden = self.visibility == Visibility::Hidden;
+        let target = if hidden {
+            [
+                geometry.0 * 0.72,
+                16.0,
+                8.0,
+                geometry.3,
+                geometry.4,
+                0.0,
+                16.0,
+            ]
+        } else {
+            [
+                geometry.0, geometry.1, geometry.2, geometry.3, geometry.4, 1.0, 20.0,
+            ]
+        };
+        for (index, target) in target.into_iter().enumerate() {
+            if reduced {
+                self.shape[index] = target;
+                self.velocity[index] = 0.0;
+            } else {
+                advance_spring(
+                    &mut self.shape[index],
+                    &mut self.velocity[index],
+                    target,
+                    delta * speed,
+                    self.motion_duration,
+                    if index >= 5 { 0.0 } else { self.motion_bounce },
+                    index == 5,
+                );
+            }
+        }
+        self.shape[0] = self.shape[0].clamp(1.0, (drawing.get_screen_width() - 40).max(1) as f32);
+        self.shape[1] = self.shape[1].clamp(1.0, (drawing.get_screen_height() - 40).max(1) as f32);
+        self.shape[2] = self.shape[2].clamp(0.0, self.shape[0].min(self.shape[1]) / 2.0);
+        self.shape[5] = self.shape[5].clamp(0.0, 1.0);
+        if self.shape[5] == 0.0 {
             return;
         }
-        if reduced {
-            self.progress = self.visibility_target;
-            self.visibility_velocity = 0.0;
-        } else {
-            update_spring(
-                &mut self.progress,
-                &mut self.visibility_velocity,
-                self.visibility_target,
-                delta * speed,
-            );
-        }
-        let expansion = self.progress;
-        let geometry_progress = if reduced {
-            1.0
-        } else {
-            ease_in_out(
-                (self.geometry_changed.elapsed().as_secs_f32() * speed / 0.325).clamp(0.0, 1.0),
-            )
-        };
-        let compact = interpolate_compact(
-            self.compact_from,
-            compact_geometry(self.scene.as_ref()),
-            geometry_progress,
-        );
-        let expanded = interpolate_compact(
-            self.expanded_from,
-            expanded_geometry(self.scene.as_ref()),
-            geometry_progress,
-        );
-        let (compact_width, compact_height, compact_radius, compact_padding_x, compact_padding_y) =
-            compact;
-        let width = lerp(compact_width, expanded.0, expansion);
-        let height = lerp(compact_height, expanded.1, expansion);
-        let radius = lerp(compact_radius, expanded.2, expansion);
+        let [width, height, radius, padding_x, padding_y, opacity, y] = self.shape;
         let x = (drawing.get_screen_width() as f32 - width) * 0.5;
-        let y = 20.0;
-        draw_shadow(drawing, Rectangle::new(x, y, width, height), radius);
+        draw_shadow(
+            drawing,
+            Rectangle::new(x, y, width, height),
+            radius,
+            opacity,
+        );
         drawing.draw_rectangle_rounded(
             Rectangle::new(x, y, width, height),
-            (radius * 2.0 / height.max(1.0)).clamp(0.0, 1.0),
-            20,
-            Color::new(0, 0, 0, 246),
+            (radius * 2.0 / width.min(height).max(1.0)).clamp(0.0, 1.0),
+            32,
+            Color::BLACK.alpha(opacity),
         );
         let surface = if self.visibility == Visibility::Expanded {
             "expanded"
         } else {
             "compact"
         };
-        let padding_x = lerp(compact_padding_x, expanded.3, expansion);
-        let padding_y = lerp(compact_padding_y, expanded.4, expansion);
+        // Lay out at the destination size so text never scales or reflows with the spring.
         let bounds = Rectangle::new(
-            x + padding_x,
-            y + padding_y,
-            width - padding_x * 2.0,
-            height - padding_y * 2.0,
+            (drawing.get_screen_width() as f32 - geometry.0) * 0.5 + geometry.3,
+            y + geometry.4,
+            geometry.0 - geometry.3 * 2.0,
+            geometry.1 - geometry.4 * 2.0,
         );
-        if let Some(scene) = self.scene.clone() {
-            self.draw_scene(drawing, &scene, surface, bounds, mouse);
+        let mut clip = drawing.begin_scissor_mode(
+            (x + padding_x) as i32,
+            (y + padding_y) as i32,
+            (width - 2.0 * padding_x).max(0.0) as i32,
+            (height - 2.0 * padding_y).max(0.0) as i32,
+        );
+        if let Some((previous, visibility, began)) = self.outgoing.clone() {
+            let alpha = if reduced {
+                0.0
+            } else {
+                1.0 - began.elapsed().as_secs_f32() * speed / 0.10
+            };
+            if alpha > 0.0 {
+                let (width, height, _, px, py) = if visibility == Visibility::Expanded {
+                    expanded_geometry(Some(&previous))
+                } else {
+                    compact_geometry(Some(&previous))
+                };
+                let old_bounds = Rectangle::new(
+                    bounds.x + bounds.width * 0.5 - width * 0.5 + px,
+                    y + py,
+                    width - px * 2.0,
+                    height - py * 2.0,
+                );
+                self.draw_scene(
+                    &mut clip,
+                    &previous,
+                    if visibility == Visibility::Expanded {
+                        "expanded"
+                    } else {
+                        "compact"
+                    },
+                    old_bounds,
+                    mouse,
+                    alpha,
+                );
+                self.hits.clear();
+            } else {
+                self.outgoing = None;
+            }
+        }
+        if !hidden && let Some(scene) = self.scene.clone() {
+            let alpha = if reduced {
+                1.0
+            } else {
+                (self.changed.elapsed().as_secs_f32() * speed / 0.15).clamp(0.0, 1.0)
+            };
+            self.draw_scene(&mut clip, &scene, surface, bounds, mouse, alpha);
+        }
+        if let Some(hit) = self.focused_hit() {
+            clip.draw_rectangle_rounded_lines_ex(
+                hit.rectangle,
+                0.7,
+                20,
+                2.0,
+                Color::new(41, 151, 255, 255),
+            );
         }
     }
     fn draw_scene(
         &mut self,
-        drawing: &mut RaylibDrawHandle<'_>,
+        drawing: &mut impl RaylibDraw,
         scene: &Value,
         surface: &str,
         bounds: Rectangle,
         mouse: Vector2,
+        content_alpha: f32,
     ) {
         let Some(root) = scene.get(surface).filter(|value| !value.is_null()) else {
             return;
         };
+        let mut root = root.clone();
+        if bounds.width < 360.0 {
+            fit_calendar(&mut root, bounds.width);
+        }
         let owner = scene
             .get(format!("{surface}_owner"))
             .and_then(Value::as_str)
@@ -353,7 +448,7 @@ impl Renderer {
             .unwrap_or_default();
         let mut tree: TaffyTree<Value> = TaffyTree::new();
         let mut nodes = HashMap::new();
-        let Ok(root_id) = build_node(&mut tree, &mut nodes, root) else {
+        let Ok(root_id) = build_node(&mut tree, &mut nodes, &root) else {
             return;
         };
         if let Ok(current) = tree.style(root_id) {
@@ -364,6 +459,7 @@ impl Renderer {
             let _ = tree.set_style(root_id, style);
         }
         let pango = &self.pango;
+        let fonts = &self.fonts;
         let measurements = &mut self.measurements;
         if tree
             .compute_layout_with_measure(
@@ -373,7 +469,7 @@ impl Renderer {
                     height: AvailableSpace::Definite(bounds.height),
                 },
                 |known, available, _, context, _| {
-                    measure_leaf(known, available, context, pango, measurements)
+                    measure_leaf(known, available, context, pango, fonts, measurements)
                 },
             )
             .is_err()
@@ -395,11 +491,11 @@ impl Renderer {
         let remaining = if reduced {
             0.0
         } else {
-            1.0 - ease_in_out((self.changed.elapsed().as_secs_f32() * speed / 0.25).clamp(0.0, 1.0))
+            1.0 - ease_in_out((self.changed.elapsed().as_secs_f32() * speed / 0.18).clamp(0.0, 1.0))
         };
         let offset = match transition {
-            Some("slide-left") => 48.0 * remaining,
-            Some("slide-right") => -48.0 * remaining,
+            Some("slide-left") => 12.0 * remaining,
+            Some("slide-right") => -12.0 * remaining,
             _ => 0.0,
         };
         let elapsed = if reduced {
@@ -411,7 +507,7 @@ impl Renderer {
             lerp(
                 self.meter_from,
                 target,
-                ease_out((elapsed / 0.27).clamp(0.0, 1.0)),
+                ease_out((elapsed / 0.20).clamp(0.0, 1.0)),
             )
         });
         draw_node(
@@ -421,7 +517,7 @@ impl Renderer {
             root_id,
             Vector2::new(bounds.x + offset, bounds.y),
             mouse,
-            1.0,
+            self.shape[5] * content_alpha,
             elapsed,
             meter_progress,
             owner,
@@ -477,7 +573,13 @@ fn configured_geometry(
     };
     (
         number(width_key, defaults.0),
-        number(height_key, defaults.1),
+        scene
+            .and_then(|s| s.get(format!("{surface}_presentation")))
+            .and_then(|p| p.get(format!("{surface}_height")))
+            .and_then(Value::as_f64)
+            .map_or(number(height_key, defaults.1), |h| {
+                (h as f32).clamp(48.0, number(height_key, defaults.1).max(48.0))
+            }),
         number("radius", defaults.2),
         number("padding_horizontal", number("padding", defaults.3)),
         number("padding_vertical", number("padding", defaults.4)),
@@ -503,20 +605,6 @@ fn expanded_geometry(scene: Option<&Value>) -> (f32, f32, f32, f32, f32) {
         "max_width",
         "max_height",
         (432.0, 344.0, 30.0, 24.0, 24.0),
-    )
-}
-
-fn interpolate_compact(
-    from: (f32, f32, f32, f32, f32),
-    to: (f32, f32, f32, f32, f32),
-    progress: f32,
-) -> (f32, f32, f32, f32, f32) {
-    (
-        lerp(from.0, to.0, progress),
-        lerp(from.1, to.1, progress),
-        lerp(from.2, to.2, progress),
-        lerp(from.3, to.3, progress),
-        lerp(from.4, to.4, progress),
     )
 }
 
@@ -573,6 +661,7 @@ fn validate_node(node: &Value, depth: usize) -> Result<()> {
         "spacer",
         "progress",
         "indicator",
+        "divider",
         "button",
         "action_region",
     ]
@@ -609,15 +698,24 @@ fn build_node(
     node: &Value,
 ) -> Result<NodeId> {
     let kind = node.get("type").and_then(Value::as_str).unwrap_or("text");
-    let gap = gap_value(node.get("gap"));
+    let gap = number(node, "_gap", gap_value(node.get("gap")));
     let mut style = Style {
         display: Display::Flex,
         gap: Size {
             width: length(gap),
             height: length(gap),
         },
+        flex_shrink: 0.0,
+        flex_grow: number(node, "grow", 0.0),
+        min_size: Size {
+            width: length(0.0),
+            height: length(0.0),
+        },
         ..Default::default()
     };
+    if node.get("grow").is_some() {
+        style.flex_basis = length(0.0);
+    }
     let id = match kind {
         "row" | "column" => {
             style.flex_direction = if kind == "row" {
@@ -627,6 +725,7 @@ fn build_node(
             };
             style.align_items = Some(match node.get("alignment").and_then(Value::as_str) {
                 Some("start") => AlignItems::FLEX_START,
+                Some("stretch") => AlignItems::STRETCH,
                 Some("end") => AlignItems::FLEX_END,
                 _ => AlignItems::CENTER,
             });
@@ -642,10 +741,26 @@ fn build_node(
         "button" | "action_region" => {
             let input = node.get("style").and_then(Value::as_str) == Some("input");
             style.align_items = Some(AlignItems::CENTER);
+            style.justify_content = Some(JustifyContent::CENTER);
+            let control = &node["_control"];
+            if let Some(width) = control["width"].as_f64() {
+                style.size.width = length(width as f32);
+            }
+            if let Some(height) = control["height"].as_f64() {
+                style.min_size.height = length(height as f32);
+            }
             if input {
                 style.size.width = percent(1.0);
             }
-            let (horizontal, vertical) = if input { (10.0, 8.0) } else { (6.0, 4.0) };
+            let (horizontal, vertical) = if input {
+                (10.0, 8.0)
+            } else if control.is_object() {
+                (number(control, "padding", 0.0), 0.0)
+            } else if kind == "action_region" {
+                (0.0, 0.0)
+            } else {
+                (6.0, 4.0)
+            };
             style.padding = Rect {
                 left: length(horizontal),
                 right: length(horizontal),
@@ -653,7 +768,21 @@ fn build_node(
                 bottom: length(vertical),
             };
             let child = build_node(tree, nodes, node.get("content").unwrap())?;
+            if kind == "action_region" {
+                let mut child_style = tree.style(child)?.clone();
+                child_style.flex_grow = 1.0;
+                child_style.flex_shrink = 1.0;
+                child_style.min_size.width = length(0.0);
+                tree.set_style(child, child_style)?;
+            }
             tree.new_with_children(style, &[child])?
+        }
+        "divider" => {
+            style.size = Size {
+                width: percent(1.0),
+                height: length(1.0),
+            };
+            tree.new_leaf(style)?
         }
         "spacer" => {
             if node
@@ -680,6 +809,7 @@ fn measure_leaf(
     available: Size<AvailableSpace>,
     context: Option<&mut Value>,
     pango: &pango::Context,
+    fonts: &HashMap<String, Font>,
     measurements: &mut HashMap<String, (f32, f32)>,
 ) -> Size<f32> {
     if let Size {
@@ -696,19 +826,60 @@ fn measure_leaf(
     let measured = match kind {
         "text" | "rich_text" => {
             let text = component_text(node);
-            let size = role_size(node.get("role").and_then(Value::as_str));
+            let size = number(
+                node,
+                "_size",
+                role_size(node.get("role").and_then(Value::as_str)),
+            );
             let available_width = match available.width {
                 AvailableSpace::Definite(width) => width,
                 _ => -1.0,
             };
-            let key = format!("{size}:{available_width}:{text}");
+            let key = format!("{size}:{available_width}:{}:{text}", node["_font"]);
             if let Some(&(width, height)) = measurements.get(&key) {
                 return Size { width, height };
+            }
+            if let Some(font) = node["_font"].as_str().and_then(|name| fonts.get(name)) {
+                let draw_size = size * (2478.0 / 2048.0);
+                let line_height = size * number(node, "_line_height", 1.2);
+                let lines = if node["_single_line"] == true {
+                    vec![text.clone()]
+                } else {
+                    wrap_text(
+                        font,
+                        &text,
+                        draw_size,
+                        if available_width < 0.0 {
+                            f32::MAX
+                        } else {
+                            available_width
+                        },
+                    )
+                };
+                let natural_width = lines
+                    .iter()
+                    .map(|line| font.measure_text(line, draw_size, 0.0).x)
+                    .fold(0.0, f32::max)
+                    .ceil();
+                let width = if node["_single_line"] == true && available_width >= 0.0 {
+                    natural_width.min(available_width)
+                } else {
+                    natural_width
+                };
+                let height = (line_height * lines.len().max(1) as f32).ceil();
+                measurements.insert(key, (width, height));
+                return Size {
+                    width: known.width.unwrap_or(width),
+                    height: known.height.unwrap_or(height),
+                };
             }
             let layout = pango::Layout::new(pango);
             layout.set_text(&text);
             let mut font = pango::FontDescription::new();
             font.set_family("Inter");
+            if node["_font"] == "semibold" {
+                font.set_weight(pango::Weight::Semibold);
+            }
             font.set_absolute_size(f64::from(size) * f64::from(pango::SCALE));
             layout.set_font_description(Some(&font));
             if let AvailableSpace::Definite(width) = available.width {
@@ -719,39 +890,35 @@ fn measure_leaf(
             measurements.insert(key, (width as f32, height as f32));
             Size {
                 width: width as f32,
-                height: height as f32,
+                height: (height as f32).max(size * number(node, "_line_height", 1.2)),
             }
         }
         "icon" => {
-            let size = if node.get("name").and_then(Value::as_str) == Some("application") {
-                32.0
-            } else {
-                20.0
-            };
+            let size = number(node, "size", number(node, "_size", 20.0));
             Size {
                 width: size,
                 height: size,
             }
         }
         "image" => Size {
-            width: 32.0,
-            height: 32.0,
+            width: number(node, "_width", 32.0),
+            height: number(node, "_height", 32.0),
         },
         "progress" if node.get("shape").and_then(Value::as_str) == Some("ring") => Size {
-            width: 32.0,
-            height: 32.0,
+            width: number(node, "size", 32.0),
+            height: number(node, "size", 32.0),
         },
         "progress" => Size {
             width: 120.0,
-            height: 8.0,
+            height: 5.0,
         },
         "indicator" => Size {
             width: 20.0,
             height: 20.0,
         },
         "spacer" => Size {
-            width: 6.0,
-            height: 6.0,
+            width: number(node, "size", 6.0),
+            height: number(node, "size", 6.0),
         },
         _ => Size::ZERO,
     };
@@ -763,7 +930,7 @@ fn measure_leaf(
 
 #[allow(clippy::too_many_arguments)]
 fn draw_node(
-    d: &mut RaylibDrawHandle<'_>,
+    d: &mut impl RaylibDraw,
     tree: &TaffyTree<Value>,
     nodes: &HashMap<NodeId, Value>,
     id: NodeId,
@@ -792,7 +959,7 @@ fn draw_node(
         "text" | "rich_text" => {
             let text = node.map(component_text).unwrap_or_default();
             let role = node.and_then(|v| v.get("role")).and_then(Value::as_str);
-            let size = role_size(role);
+            let size = node.map_or(role_size(role), |n| number(n, "_size", role_size(role)));
             let font_name = if matches!(
                 role,
                 Some("title" | "caption" | "button" | "compact-primary" | "current" | "accent")
@@ -801,8 +968,39 @@ fn draw_node(
             } else {
                 "regular"
             };
+            let font_name = node.and_then(|n| n["_font"].as_str()).unwrap_or(font_name);
             if let Some(font) = fonts.get(font_name) {
-                d.draw_text_ex(font, &text, origin, size, 0.0, color);
+                let line_height = size * node.map_or(1.2, |n| number(n, "_line_height", 1.2));
+                // shortcut: calibrated to bundled Inter metrics; recalibrate if replacing the text fonts.
+                let draw_size = size * (2478.0 / 2048.0);
+                let lines = if node.is_some_and(|n| n["_single_line"] == true) {
+                    let mut label = text.clone();
+                    if font.measure_text(&label, draw_size, 0.0).x > rect.width + 0.5 {
+                        while !label.is_empty()
+                            && font.measure_text(&(label.clone() + "…"), draw_size, 0.0).x
+                                > rect.width
+                        {
+                            label.pop();
+                        }
+                        label.push('…');
+                    }
+                    vec![label]
+                } else {
+                    wrap_text(font, &text, draw_size, rect.width)
+                };
+                for (index, line) in lines.iter().enumerate() {
+                    if index as f32 * line_height + size > rect.height + 2.0 {
+                        break;
+                    }
+                    d.draw_text_ex(
+                        font,
+                        line,
+                        Vector2::new(origin.x, origin.y + index as f32 * line_height),
+                        draw_size,
+                        0.0,
+                        color,
+                    );
+                }
             } else {
                 d.draw_text(&text, origin.x as i32, origin.y as i32, size as i32, color);
             }
@@ -854,6 +1052,8 @@ fn draw_node(
                 "volume-muted" => 0xF6A9,
                 "volume-low" => 0xF027,
                 "volume-high" => 0xF028,
+                "notification" => 0xF0F3,
+                "warning" => 0xF071,
                 _ => 0xF111,
             };
             let symbol = if application {
@@ -866,8 +1066,38 @@ fn draw_node(
             } else {
                 origin
             };
-            if let Some(font) = fonts.get(if application { "regular" } else { "icons" }) {
-                d.draw_text_ex(font, &symbol, icon_origin, 20.0, 0.0, color);
+            if let Some(texture) = node
+                .and_then(|n| n["_icon"]["source"].as_str())
+                .and_then(|source| textures.get(source))
+            {
+                let icon_rect = if node.is_some_and(|n| n["style"] == "app-symbol") {
+                    d.draw_rectangle_rounded(
+                        rect,
+                        0.6,
+                        20,
+                        Color::new(39, 39, 41, 255).alpha(alpha),
+                    );
+                    Rectangle::new(rect.x + 10.0, rect.y + 10.0, 20.0, 20.0)
+                } else {
+                    rect
+                };
+                d.draw_texture_pro(
+                    texture,
+                    Rectangle::new(0.0, 0.0, texture.width as f32, texture.height as f32),
+                    icon_rect,
+                    Vector2::zero(),
+                    0.0,
+                    color,
+                );
+            } else if let Some(font) = fonts.get(if application { "regular" } else { "icons" }) {
+                d.draw_text_ex(
+                    font,
+                    &symbol,
+                    icon_origin,
+                    rect.width.min(rect.height),
+                    0.0,
+                    color,
+                );
             } else {
                 d.draw_text(
                     if application { "?" } else { "•" },
@@ -916,37 +1146,80 @@ fn draw_node(
                 .and_then(Value::as_f64)
                 .unwrap_or(target as f64) as f32;
             let progress = meter_progress
-                .unwrap_or_else(|| lerp(from, target, ease_out((elapsed / 0.27).clamp(0.0, 1.0))))
+                .unwrap_or_else(|| lerp(from, target, ease_out((elapsed / 0.20).clamp(0.0, 1.0))))
                 .clamp(0.0, 1.0);
             if node.and_then(|v| v.get("shape")).and_then(Value::as_str) == Some("ring") {
-                let center = Vector2::new(origin.x + 16.0, origin.y + 16.0);
+                let radius =
+                    rect.width.min(rect.height) * 0.5 - if rect.width > 32.0 { 2.5 } else { 0.0 };
+                let center =
+                    Vector2::new(origin.x + rect.width * 0.5, origin.y + rect.height * 0.5);
                 d.draw_ring(
                     center,
-                    11.0,
-                    15.0,
+                    radius - 5.0,
+                    radius,
                     -90.0,
                     270.0,
                     48,
-                    Color::new(90, 90, 96, (80.0 * alpha) as u8),
+                    color.alpha(0.25 * alpha),
                 );
                 d.draw_ring(
                     center,
-                    11.0,
-                    15.0,
+                    radius - 5.0,
+                    radius,
                     -90.0,
                     -90.0 + progress * 360.0,
                     48,
                     color,
                 );
+                if progress > 0.0 {
+                    let middle = radius - 2.5;
+                    for angle in [
+                        -std::f32::consts::FRAC_PI_2,
+                        -std::f32::consts::FRAC_PI_2 + progress * std::f32::consts::TAU,
+                    ] {
+                        d.draw_circle_v(
+                            Vector2::new(
+                                center.x + middle * angle.cos(),
+                                center.y + middle * angle.sin(),
+                            ),
+                            2.5,
+                            color,
+                        );
+                    }
+                }
+                if rect.width > 32.0 {
+                    let points = [
+                        (-1.0, -12.0),
+                        (-10.0, 2.0),
+                        (-2.0, 2.0),
+                        (-5.0, 14.0),
+                        (6.0, -6.0),
+                        (-3.0, -6.0),
+                        (-1.0, -12.0),
+                    ];
+                    for edge in points.windows(2) {
+                        d.draw_line_ex(
+                            Vector2::new(center.x + edge[0].0, center.y + edge[0].1),
+                            Vector2::new(center.x + edge[1].0, center.y + edge[1].1),
+                            1.8,
+                            Color::new(245, 245, 247, 255).alpha(alpha),
+                        );
+                    }
+                }
             } else {
-                let thickness = 6.0;
+                let thickness = 5.0;
                 let track = Rectangle::new(
                     origin.x,
                     origin.y + (rect.height - thickness) * 0.5,
                     rect.width,
                     thickness,
                 );
-                d.draw_rectangle_rounded(track, 1.0, 10, Color::new(90, 90, 96, 80));
+                d.draw_rectangle_rounded(
+                    track,
+                    1.0,
+                    10,
+                    Color::new(39, 39, 41, (255.0 * alpha) as u8),
+                );
                 d.draw_rectangle_rounded(
                     Rectangle::new(track.x, track.y, track.width * progress, track.height),
                     1.0,
@@ -1003,15 +1276,39 @@ fn draw_node(
                 0.35,
                 10,
                 1.5,
-                Color::new(124, 92, 252, (190.0 * alpha) as u8),
+                Color::new(41, 151, 255, (190.0 * alpha) as u8),
             );
         }
-        "button" | "action_region" if hovered => d.draw_rectangle_rounded(
-            rect,
-            0.35,
-            10,
-            Color::new(255, 255, 255, (20.0 * alpha) as u8),
-        ),
+        "button" | "action_region" => {
+            let control = node.map(|n| &n["_control"]);
+            let radius = control.map_or(12.0, |c| number(c, "radius", 12.0));
+            let roundness = (radius * 2.0 / rect.width.min(rect.height).max(1.0)).clamp(0.0, 1.0);
+            if let Some(background) = control
+                .and_then(|c| c["background"].as_str())
+                .and_then(parse_color)
+            {
+                d.draw_rectangle_rounded(rect, roundness, 20, background.alpha(alpha));
+            }
+            if hovered {
+                d.draw_rectangle_rounded(rect, roundness, 20, Color::WHITE.alpha(0.12 * alpha));
+            }
+            let border = control
+                .and_then(|c| c["border"].as_str())
+                .and_then(parse_color);
+            if let Some(border) = border {
+                d.draw_rectangle_rounded_lines_ex(rect, roundness, 20, 1.0, border.alpha(alpha));
+            }
+            if node.is_some_and(|n| n["focused"] == true) {
+                d.draw_rectangle_rounded_lines_ex(
+                    rect,
+                    roundness,
+                    20,
+                    2.0,
+                    Color::new(41, 151, 255, 255).alpha(alpha),
+                );
+            }
+        }
+        "divider" => d.draw_rectangle_rec(rect, color),
         _ => {}
     }
     if matches!(kind, "button" | "action_region")
@@ -1123,6 +1420,138 @@ fn collect_image_paths(value: &Value, paths: &mut Vec<String>) {
         }
     }
 }
+fn fit_calendar(node: &mut Value, width: f32) {
+    if node["style"]
+        .as_str()
+        .is_some_and(|style| style.starts_with("day"))
+    {
+        node["_control"]["width"] = Value::from(((width - 24.0) / 7.0).min(44.0));
+    }
+    if let Some(children) = node.get_mut("children").and_then(Value::as_array_mut) {
+        for child in children {
+            fit_calendar(child, width);
+        }
+    }
+    if matches!(node["type"].as_str(), Some("button" | "action_region")) {
+        fit_calendar(&mut node["content"], width);
+    }
+}
+
+fn number(node: &Value, name: &str, default: f32) -> f32 {
+    node.get(name)
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite())
+        .map_or(default, |n| n as f32)
+}
+
+fn parse_color(value: &str) -> Option<Color> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 && hex.len() != 8 {
+        return None;
+    }
+    let rgb = u32::from_str_radix(hex, 16).ok()?;
+    Some(if hex.len() == 6 {
+        Color::new((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, 255)
+    } else {
+        Color::new(
+            (rgb >> 24) as u8,
+            (rgb >> 16) as u8,
+            (rgb >> 8) as u8,
+            rgb as u8,
+        )
+    })
+}
+
+fn resolve_theme(node: &mut Value, theme: &Value) {
+    let role = node["role"].as_str().unwrap_or("body");
+    let single_line = role.starts_with("compact-");
+    let typography = &theme["typography"][role];
+    let palette = &theme["palette"];
+    let token = node["state"]
+        .as_str()
+        .or_else(|| typography["color"].as_str())
+        .unwrap_or("foreground");
+    let color = if node["type"] == "divider" {
+        &palette["divider"]
+    } else {
+        &palette[token]
+    };
+    let size = if node["type"] == "icon" && node["role"].is_null() {
+        20.0
+    } else {
+        typography["size"]
+            .as_f64()
+            .unwrap_or(role_size(Some(role)) as f64)
+    };
+    let font = typography["font"].as_str().unwrap_or("regular").to_owned();
+    let image = theme["images"][role].clone();
+    let gap = theme["gaps"][node["gap"].as_str().unwrap_or("normal")].clone();
+    let mut control = theme["controls"][node["style"].as_str().unwrap_or("")].clone();
+    for key in ["background", "border"] {
+        if let Some(token) = control[key].as_str() {
+            let resolved = palette[token].clone();
+            if !resolved.is_null() {
+                control[key] = resolved;
+            }
+        }
+    }
+    if let Some(source) = theme["icons"][node["name"].as_str().unwrap_or("")]["source"].as_str() {
+        node["_icon"] = serde_json::json!({ "kind": "path", "source": source });
+    }
+    node["_single_line"] = Value::from(single_line);
+    node["_color"] = color.clone();
+    node["_size"] = Value::from(size.clamp(1.0, 128.0));
+    node["_font"] = Value::from(font);
+    node["_line_height"] = typography["line_height"].clone();
+    node["_control"] = control;
+    node["_gap"] = gap;
+    node["_width"] = image["width"].clone();
+    node["_height"] = image["height"].clone();
+    if let Some(children) = node.get_mut("children").and_then(Value::as_array_mut) {
+        for child in children {
+            resolve_theme(child, theme);
+        }
+    }
+    if matches!(node["type"].as_str(), Some("button" | "action_region")) {
+        resolve_theme(&mut node["content"], theme);
+    }
+}
+
+fn wrap_text(font: &Font, text: &str, size: f32, width: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_inclusive(char::is_whitespace) {
+        if !line.is_empty()
+            && font
+                .measure_text(&(line.clone() + word.trim_end()), size, 0.0)
+                .x
+                > width + 0.5
+        {
+            lines.push(line.trim_end().to_owned());
+            line.clear();
+        }
+        for character in word.chars() {
+            if character == '\n' {
+                lines.push(std::mem::take(&mut line));
+                continue;
+            }
+            if !line.is_empty()
+                && font
+                    .measure_text(&(line.clone() + &character.to_string()), size, 0.0)
+                    .x
+                    > width + 0.5
+            {
+                lines.push(std::mem::take(&mut line));
+            }
+            line.push(character);
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line.trim_end().to_owned());
+    }
+    lines
+}
+
 fn role_size(role: Option<&str>) -> f32 {
     match role {
         Some("title") => 22.0,
@@ -1132,6 +1561,12 @@ fn role_size(role: Option<&str>) -> f32 {
     }
 }
 fn node_color(node: Option<&Value>, alpha: f32) -> Color {
+    if let Some(color) = node
+        .and_then(|n| n["_color"].as_str())
+        .and_then(parse_color)
+    {
+        return color.alpha(alpha);
+    }
     let role = node
         .and_then(|v| v.get("state").or_else(|| v.get("role")))
         .and_then(Value::as_str);
@@ -1155,19 +1590,20 @@ fn gap_value(value: Option<&Value>) -> f32 {
         _ => 12.0,
     }
 }
-fn draw_shadow(d: &mut RaylibDrawHandle<'_>, rect: Rectangle, radius: f32) {
-    for step in (1..=6).rev() {
-        let grow = step as f32 * 3.0;
+fn draw_shadow(d: &mut RaylibDrawHandle<'_>, rect: Rectangle, radius: f32, opacity: f32) {
+    for step in (1..=16).rev() {
+        let grow = step as f32;
+        let shadow = Rectangle::new(
+            rect.x - grow,
+            rect.y + 8.0 - grow,
+            rect.width + grow * 2.0,
+            rect.height + grow * 2.0,
+        );
         d.draw_rectangle_rounded(
-            Rectangle::new(
-                rect.x - grow,
-                rect.y + 4.0 - grow,
-                rect.width + grow * 2.0,
-                rect.height + grow * 2.0,
-            ),
-            radius / rect.height.max(1.0),
-            20,
-            Color::new(0, 0, 0, (5 * (7 - step)) as u8),
+            shadow,
+            ((radius + grow) * 2.0 / shadow.width.min(shadow.height)).clamp(0.0, 1.0),
+            32,
+            Color::new(0, 0, 0, (1.5 * opacity) as u8),
         );
     }
 }
@@ -1204,19 +1640,41 @@ fn ease_out(value: f32) -> f32 {
     cubic_bezier(value, 0.0, 0.0, 0.58, 1.0)
 }
 
-fn update_spring(value: &mut f32, velocity: &mut f32, target: f32, delta: f32) {
-    const STIFFNESS: f32 = 220.0;
-    const DAMPING: f32 = 21.36;
-    const MAX_STEP: f32 = 1.0 / 240.0;
-    let mut remaining = delta.clamp(0.0, 0.05);
-    while remaining > 0.0 {
-        let step = remaining.min(MAX_STEP);
-        let acceleration = STIFFNESS * (target - *value) - DAMPING * *velocity;
-        *velocity += acceleration * step;
-        *value += *velocity * step;
-        remaining -= step;
+// Closed-form damped spring: retargeting preserves both position and velocity.
+fn advance_spring(
+    value: &mut f32,
+    velocity: &mut f32,
+    target: f32,
+    delta: f32,
+    duration: f32,
+    bounce: f32,
+    opacity: bool,
+) {
+    if duration <= 0.0 {
+        *value = target;
+        *velocity = 0.0;
+        return;
     }
-    if (target - *value).abs() < 0.0005 && velocity.abs() < 0.005 {
+    let omega = std::f32::consts::TAU / (duration * 0.6);
+    let damping = (1.0 - bounce).clamp(0.01, 1.0);
+    let displacement = *value - target;
+    let dt = delta.clamp(0.0, 0.1);
+    if damping >= 1.0 {
+        let decay = (-omega * dt).exp();
+        let term = *velocity + omega * displacement;
+        *value = target + (displacement + term * dt) * decay;
+        *velocity = (*velocity - omega * term * dt) * decay;
+    } else {
+        let alpha = damping * omega;
+        let frequency = omega * (1.0 - damping * damping).sqrt();
+        let decay = (-alpha * dt).exp();
+        let (sine, cosine) = (frequency * dt).sin_cos();
+        let term = (*velocity + alpha * displacement) / frequency;
+        *value = target + decay * (displacement * cosine + term * sine);
+        *velocity = decay * (*velocity * cosine - (alpha * term + frequency * displacement) * sine);
+    }
+    let (position_epsilon, speed_epsilon) = if opacity { (0.002, 0.04) } else { (0.25, 4.0) };
+    if (target - *value).abs() < position_epsilon && velocity.abs() < speed_epsilon {
         *value = target;
         *velocity = 0.0;
     }
@@ -1227,18 +1685,162 @@ fn lerp(from: f32, to: f32, amount: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{expanded_geometry, update_spring};
+    use super::{advance_spring, expanded_geometry};
     use serde_json::json;
 
     #[test]
-    fn spring_overshoots_then_settles_like_main() {
+    fn keyboard_focus_cycles_and_wraps() {
+        let mut renderer = super::Renderer::new(std::path::PathBuf::from("assets"));
+        for action in ["cancel", "confirm"] {
+            renderer.hits.push(super::HitRegion {
+                rectangle: raylib::prelude::Rectangle::new(0.0, 0.0, 44.0, 44.0),
+                owner: None,
+                action: action.into(),
+            });
+        }
+        renderer.focus_next(false);
+        assert_eq!(renderer.focused_hit().unwrap().action, "cancel");
+        renderer.focus_next(true);
+        assert_eq!(renderer.focused_hit().unwrap().action, "confirm");
+        renderer.focus_next(false);
+        assert_eq!(renderer.focused_hit().unwrap().action, "cancel");
+    }
+
+    #[test]
+    fn spring_retarget_preserves_momentum_and_critical_motion_never_overshoots() {
+        let (mut value, mut velocity) = (0.0, 0.0);
+        advance_spring(&mut value, &mut velocity, 100.0, 0.04, 0.4, 0.24, false);
+        let before = value;
+        advance_spring(&mut value, &mut velocity, 0.0, 0.001, 0.26, 0.08, false);
+        assert!(
+            value > before,
+            "an interruption must preserve forward momentum"
+        );
+        let (mut opacity, mut speed) = (0.0, 0.0);
+        for _ in 0..240 {
+            advance_spring(&mut opacity, &mut speed, 1.0, 1.0 / 240.0, 0.38, 0.0, true);
+            assert!((0.0..=1.0).contains(&opacity));
+        }
+        assert_eq!(opacity, 1.0);
+    }
+
+    #[test]
+    #[ignore = "requires Xvfb; writes native screenshots to GISLAND_SCREENSHOTS"]
+    fn render_design_fixtures() {
+        use mlua::LuaSerdeExt;
+        use raylib::prelude::*;
+        let lua = mlua::Lua::new();
+        let fixtures: mlua::Value = lua
+            .load(include_str!("../scripts/design-fixtures.lua"))
+            .eval()
+            .unwrap();
+        let scenes: Vec<serde_json::Value> = lua.from_value(fixtures).unwrap();
+        let output = std::env::var("GISLAND_SCREENSHOTS")
+            .unwrap_or_else(|_| "/tmp/gisland-screenshots".into());
+        std::fs::create_dir_all(&output).unwrap();
+        let (mut window, thread) = raylib::init()
+            .size(472, 580)
+            .title("gisland visual tests")
+            .msaa_4x()
+            .build();
+        window.set_target_fps(60);
+        for viewport_width in [472, 360] {
+            window.set_window_size(viewport_width, 580);
+            for scene in scenes.clone() {
+                let name = scene["name"].as_str().unwrap().to_owned();
+                let name = if viewport_width == 472 {
+                    name
+                } else {
+                    format!("{name}-narrow")
+                };
+                let expanded = scene["surface"] == "expanded";
+                let mut renderer = super::Renderer::new(std::path::PathBuf::from("assets"));
+                renderer.set_scene(scene).unwrap();
+                renderer.set_visibility(if expanded {
+                    super::Visibility::Expanded
+                } else {
+                    super::Visibility::Compact
+                });
+                renderer.prepare(&mut window, &thread);
+                for _ in 0..3 {
+                    let mut d = window.begin_drawing(&thread);
+                    d.clear_background(Color::new(245, 245, 247, 255));
+                    renderer.draw(&mut d, Vector2::new(-1.0, -1.0));
+                }
+                for hit in &renderer.hits {
+                    assert!(
+                        hit.rectangle.x >= 0.0
+                            && hit.rectangle.x + hit.rectangle.width <= viewport_width as f32 + 0.5,
+                        "{name}: horizontal overflow for {}",
+                        hit.action
+                    );
+                    assert!(
+                        hit.rectangle.y >= 0.0 && hit.rectangle.y + hit.rectangle.height <= 580.5,
+                        "{name}: vertical overflow for {}",
+                        hit.action
+                    );
+                }
+                let screenshot = window.load_image_from_screen(&thread);
+                assert_eq!(
+                    screenshot.get_color(viewport_width / 2, 22),
+                    Color::BLACK,
+                    "{name}: surface must be opaque black"
+                );
+                assert!(
+                    screenshot.get_color(viewport_width / 2, 10).r > 220,
+                    "{name}: shadow must remain translucent"
+                );
+                screenshot.export_image(&format!("{output}/{name}.png"));
+                assert!(std::path::Path::new(&format!("{output}/{name}.png")).is_file());
+            }
+        }
+    }
+
+    #[test]
+    fn scene_uses_theme_typography_and_semantic_colors() {
+        let mut renderer = super::Renderer::new(std::path::PathBuf::from("assets"));
+        renderer
+            .set_scene(json!({
+                "theme": { "palette": { "foreground": "#123456" }, "typography": {
+                    "body": { "size": 23, "color": "foreground", "font": "regular" }
+                } },
+                "compact": { "type": "text", "role": "body", "value": "Hello" }
+            }))
+            .unwrap();
+        let node = &renderer.scene.as_ref().unwrap()["compact"];
+        assert_eq!(
+            super::node_color(Some(node), 1.0),
+            raylib::prelude::Color::new(18, 52, 86, 255)
+        );
+    }
+
+    #[test]
+    fn scene_accepts_dividers_between_facts() {
+        assert!(
+            super::validate_scene(&json!({ "theme": {}, "expanded": {
+            "type": "column", "children": [{ "type": "divider" }]
+        } }))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn spring_matches_handoff_overshoot_and_settles() {
         let (mut value, mut velocity, mut peak) = (0.0, 0.0, 0.0_f32);
-        for _ in 0..120 {
-            update_spring(&mut value, &mut velocity, 1.0, 1.0 / 60.0);
+        for _ in 0..480 {
+            advance_spring(
+                &mut value,
+                &mut velocity,
+                100.0,
+                1.0 / 240.0,
+                0.4,
+                0.24,
+                false,
+            );
             peak = peak.max(value);
         }
-        assert!(peak > 1.0);
-        assert_eq!(value, 1.0);
+        assert!((102.4..102.7).contains(&peak), "peak {peak}");
+        assert_eq!(value, 100.0);
         assert_eq!(velocity, 0.0);
     }
 

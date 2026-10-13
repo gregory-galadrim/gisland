@@ -474,6 +474,7 @@ fn ui_table(lua: &Lua) -> mlua::Result<Table> {
         "spacer",
         "progress",
         "indicator",
+        "divider",
         "button",
         "action_region",
     ] {
@@ -1203,4 +1204,18 @@ fn uri_table(lua: &Lua) -> mlua::Result<Table> {
         })?,
     )?;
     Ok(table)
+}
+
+#[cfg(test)]
+mod design_checks {
+    #[test]
+    fn shipped_module_interactions() {
+        for source in [
+            include_str!("../scripts/check-design.lua"),
+            include_str!("../scripts/check-power-menu.lua"),
+            include_str!("../scripts/check-runtime-focus.lua"),
+        ] {
+            mlua::Lua::new().load(source).exec().unwrap();
+        }
+    }
 }

@@ -55,8 +55,9 @@ fn run() -> Result<()> {
 
     let mut builder = raylib::init();
     builder
-        .size(472, 384)
+        .size(472, 580)
         .title("gisland")
+        .msaa_4x()
         .undecorated()
         .always_run()
         .topmost()
@@ -74,6 +75,8 @@ fn run() -> Result<()> {
             raylib::core::window::get_monitor_width(monitor),
         )
     });
+    let surface_width = monitor_width.min(472);
+    window.set_window_size(surface_width, 580);
     let mut renderer = Renderer::new(asset_root.clone());
     let mut visibility = Visibility::Compact;
     let mut visibility_name = "compact-active".to_owned();
@@ -87,7 +90,10 @@ fn run() -> Result<()> {
     let mut last_extent = renderer.extent();
     renderer.set_visibility(visibility);
     let place_window = |window: &mut RaylibHandle| {
-        window.set_window_position(monitor_x + (monitor_width - 472) / 2, monitor_y - 12);
+        window.set_window_position(
+            monitor_x + (monitor_width - surface_width) / 2,
+            monitor_y - 12,
+        );
     };
     place_window(&mut window);
     x11::shape_input(&mut window, last_extent.0, last_extent.1, true);
@@ -282,12 +288,32 @@ fn run() -> Result<()> {
                 }
             }
 
+            if window.is_key_pressed(KeyboardKey::KEY_TAB) {
+                renderer.focus_next(
+                    window.is_key_down(KeyboardKey::KEY_LEFT_SHIFT)
+                        || window.is_key_down(KeyboardKey::KEY_RIGHT_SHIFT),
+                );
+            }
+            let focused = renderer.focused_hit();
+            if window.is_key_pressed(KeyboardKey::KEY_ENTER)
+                && let Some(hit) = focused.as_ref()
+            {
+                let (reply, _) = mpsc::channel();
+                let _ = lua.send(LuaCommand::Action {
+                    owner: hit.owner.clone(),
+                    action: hit.action.clone(),
+                    reply,
+                });
+            }
             for (triggered, kind) in [
                 (up, "up"),
                 (down, "down"),
                 (owner != "drun" && left, "left"),
                 (owner != "drun" && right, "right"),
-                (window.is_key_pressed(KeyboardKey::KEY_ENTER), "enter"),
+                (
+                    focused.is_none() && window.is_key_pressed(KeyboardKey::KEY_ENTER),
+                    "enter",
+                ),
                 (window.is_key_pressed(KeyboardKey::KEY_ESCAPE), "escape"),
             ] {
                 if triggered {
@@ -327,6 +353,7 @@ fn run() -> Result<()> {
             && hover_left.elapsed() > Duration::from_millis(120)
             && visibility == Visibility::Expanded
             && !pinned
+            && input_owner.is_none()
             && reveal_until.is_none_or(|deadline| Instant::now() >= deadline)
         {
             reveal_until = None;
@@ -348,6 +375,12 @@ fn run() -> Result<()> {
                 .find(|hit| hit.rectangle.check_collision_point_rec(mouse))
                 .cloned()
         {
+            if input_owner.is_none() {
+                input_previous_focus = x11::focused_window();
+                input_owner = hit.owner.clone();
+                input_had_focus = false;
+                x11::focus_window(&mut window);
+            }
             let (reply, _) = mpsc::channel();
             let _ = lua.send(LuaCommand::Action {
                 owner: hit.owner,

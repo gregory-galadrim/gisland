@@ -34,7 +34,7 @@ return function(api, supplied)
       children[#children + 1] = api.ui.spacer {}
     end
     api.publish {
-      context_id = "drun", priority = 1000,
+      context_id = "drun", priority = 1000, presentation = { expanded_style = "drun" },
       views = {
         compact = api.ui.text { value = "Applications", role = "compact-primary" },
         expanded = api.ui.column { alignment = "start", gap = "xsmall", children = children },

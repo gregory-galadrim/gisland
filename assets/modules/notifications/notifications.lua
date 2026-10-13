@@ -141,11 +141,16 @@ return function(api, supplied)
     local routing = { [prefix .. "close"] = { "close" } }
     local resources, app_resource = {}, nil
     if app_image then app_resource = resource("app-image", app_image); resources[#resources + 1] = app_resource end
-    local header = {}
-    if app_resource then header[#header + 1] = ui.image { resource_id = "app-image", role = "notification-header-icon", accessible_label = notification.app_name ~= "" and notification.app_name or "Application" } end
-    if notification.app_name ~= "" then header[#header + 1] = text(notification.app_name:upper(), "caption") end
-    if notification.summary ~= "" then header[#header + 1] = text(notification.summary, "body") end
-    local top = { ui.row { gap = "small", children = array(header) } }
+    local header = {
+      app_resource and ui.image { resource_id = "app-image", role = "notification-header-icon", accessible_label = notification.app_name } or ui.icon { name = "notification", size = 40, style = "app-symbol" },
+      ui.column { alignment = "start", gap = "small", grow = 1, children = {
+        text(notification.app_name ~= "" and notification.app_name or "Application", "button"), text("À l’instant", "caption"),
+      } },
+      ui.button { action_id = prefix .. "close", accessible_label = "Fermer la notification", style = "icon", content = ui.icon { name = "close" } },
+    }
+    local top = { ui.row { gap = "normal", children = array(header) } }
+    local message = {}
+    if notification.summary ~= "" then message[#message + 1] = text(notification.summary, "title") end
     local body = {}
     for _, item in ipairs(parsed.items) do
       if item.type == "inline_image" then
@@ -157,24 +162,29 @@ return function(api, supplied)
         body[#body + 1] = item
       end
     end
-    if #body > 0 then top[#top + 1] = ui.rich_text { role = "notification-body", content = array(body) } end
+    if #body > 0 then message[#message + 1] = ui.rich_text { role = "notification-body", content = array(body) } end
+    if #message > 0 then top[#top + 1] = ui.column { alignment = "stretch", gap = "small", children = array(message) } end
     local buttons, action_index, default = {}, 0, nil
     for index = 1, #notification.actions, 2 do
       local key, label = notification.actions[index], notification.actions[index + 1]
       if key == "default" then default = prefix .. "default"; routing[default] = { "dbus", key }
       else
         local id = prefix .. "action-" .. tostring(action_index); action_index = action_index + 1
-        routing[id] = { "dbus", key }; buttons[#buttons + 1] = ui.button { action_id = id, accessible_label = label, content = text(label, "button") }
+        routing[id] = { "dbus", key }; buttons[#buttons + 1] = ui.button { action_id = id, accessible_label = label, grow = 1, style = action_index == 1 and "primary" or "quiet", content = text(label, "button") }
       end
     end
-    if #buttons > 0 then top[#top + 1] = ui.row { gap = "small", children = array(buttons) } end
-    local expanded = ui.column { alignment = "start", gap = "small", children = array(top) }
+    buttons[#buttons + 1] = ui.button { action_id = prefix .. "close", accessible_label = "Plus tard", grow = 1, style = "quiet", content = text("Plus tard", "button") }
+    if #buttons > 0 then top[#top + 1] = ui.row { gap = "normal", children = array(buttons) } end
+    local expanded = ui.column { alignment = "stretch", gap = "large", children = array(top) }
     if default then expanded = ui.action_region { action_id = default, accessible_label = "Open notification", content = expanded } end
-    local simple = not app_resource and #body == 0 and #buttons == 0
+    local simple = not app_resource and #body == 0 and #notification.actions == 0
     local inline_images = #resources - (app_resource and 1 or 0)
     local style = simple and "notification-small" or inline_images == 0 and "notification" or nil
     local publication = { context_id = "notification-" .. tostring(notification.id), priority = notification.priority,
-      views = { expanded = expanded }, presentation = { expanded_style = style } }
+      views = { compact = ui.row { gap = "normal", children = {
+        ui.icon { name = "notification", size = 20 },
+        text(notification.summary ~= "" and notification.summary or notification.app_name, "compact-primary"),
+      } }, expanded = expanded }, presentation = { expanded_style = style } }
     if visible_count == 0 and options.reveal_duration_ms > 0 then
       publication.presentation.reveal, publication.presentation.duration_ms = "expanded", options.reveal_duration_ms
     end
@@ -244,22 +254,40 @@ return function(api, supplied)
     return tostring(math.floor(elapsed / 86400)) .. " j"
   end
   function history_publication()
-    local children = { text("Notifications", "title") }
+    local children = { ui.row { children = {
+      ui.column { alignment = "start", gap = "none", grow = 1, children = { text("Notifications récentes", "compact-primary"), text(tostring(#history) .. " notifications", "caption") } },
+      ui.button { action_id = "close-history", accessible_label = "Fermer l’historique", style = "icon", content = ui.icon { name = "close" } },
+    } } }
     local count = 0
     for _, record in ipairs(history) do
       if not hidden[record.sequence] and count < visible_count then
         local content = record.summary ~= "" and record.summary or record.body
-        children[#children + 1] = ui.action_region { action_id = "history:" .. tostring(session) .. ":hide:" .. tostring(record.sequence), accessible_label = "Masquer " .. content, content = ui.column { alignment = "start", gap = "xsmall", children = { ui.row { gap = "small", children = { text(record.app_name ~= "" and record.app_name:upper() or "APPLICATION", "caption"), ui.spacer { flexible = true }, text(age(record.received_at), "caption") } }, text(content, "body") } } }
+        children[#children + 1] = ui.divider {}
+        children[#children + 1] = ui.action_region { action_id = "history:" .. tostring(session) .. ":hide:" .. tostring(record.sequence), accessible_label = "Masquer " .. content,
+          content = ui.row { gap = "normal", children = {
+            ui.icon { name = "notification", size = 20 },
+            ui.column { alignment = "start", gap = "xsmall", grow = 1, children = {
+              text(content, "button"), text(age(record.received_at) .. " · " .. (record.app_name ~= "" and record.app_name or "Application"), "caption"),
+            } },
+          } } }
+
         count = count + 1
       end
     end
-    if count == 0 then children[#children + 1] = text("Aucune notification", "caption") end
-    return { context_id = "history", priority = 100, views = { expanded = ui.column { alignment = "start", gap = "xsmall", children = children } } }
+    if count == 0 then
+      children[#children + 1] = text("Aucune notification", "body")
+      children[#children + 1] = text("Vous êtes à jour.", "muted")
+    end
+    if count < #history and visible_count < options.history_visible_limit then
+      children[#children + 1] = ui.button { action_id = "show-more", accessible_label = "Voir une notification plus ancienne", style = "link", content = text("Voir une notification plus ancienne", "accent") }
+    end
+    return { context_id = "history", priority = 100, presentation = { expanded_style = "history", expanded_height = math.min(520, count == 0 and 180 or 148 + count * 76) }, views = { expanded = ui.column { alignment = "stretch", gap = "normal", children = children } } }
   end
   local function close_history()
     cancel(open_timer); cancel(inactivity_timer); open_timer, inactivity_timer = nil, nil
     if api.overlay and api.overlay.close then api.overlay.close() end
     api.dismiss("history"); visible_count, history_was_expanded, hidden = 0, false, {}
+    return true
   end
   local function show_more()
     if visible_count == 0 then session, hidden = session + 1, {} end
@@ -305,7 +333,7 @@ return function(api, supplied)
 
   return {
     start = function() local ok, message = pcall(start); if not ok then log_error(message) end end,
-    actions = { ["show-more"] = show_more },
+    actions = { ["show-more"] = show_more, ["close-history"] = close_history },
     fallback_action = invoke,
     visibility = function(value)
       visibility = value

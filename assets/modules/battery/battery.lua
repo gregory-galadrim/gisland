@@ -58,7 +58,7 @@ return function(api, supplied)
     local estimate = duration(reading.on_battery and reading.time_to_empty or reading.time_to_full)
     local state_text = reading.state == "charging" and "Charge" or
       reading.state == "fully-charged" and "Chargée" or
-      reading.on_battery and "Décharge" or "Secteur"
+      reading.on_battery and "Sur batterie" or "Secteur"
     local health = "—"
     if reading.energy_full > 0 and reading.energy_full_design > 0 then
       health = tostring(round(reading.energy_full / reading.energy_full_design * 100)) .. " %"
@@ -77,29 +77,38 @@ return function(api, supplied)
   local ui = api.ui
   local function row(label, value)
     return ui.row { gap = "small", children = {
-      ui.text { value = label, role = "caption" }, ui.spacer { flexible = true }, ui.text { value = value, role = "body" },
+      ui.text { value = label, role = "muted" }, ui.spacer { flexible = true }, ui.text { value = value, role = "body" },
     } }
   end
   local function compact_view(value)
     return ui.row { gap = "small", children = {
       ui.progress { shape = "ring", value = value.level, state = value.semantic_state },
-      ui.text { value = value.percent_text, role = "compact-primary" }, ui.spacer { flexible = true },
-      ui.text { value = value.estimate_compact, role = "compact-secondary" },
+      ui.text { value = value.percent_text, role = "battery-compact" }, ui.spacer { flexible = true },
+      ui.text { value = value.estimate_compact, role = "caption" },
     } }
   end
   local function expanded_view(value, dismissible)
-    local children = {
-      ui.row { gap = "normal", children = {
-        ui.progress { shape = "ring", value = value.level, state = value.semantic_state },
-        ui.text { value = value.percent_text, role = "title" }, ui.spacer { flexible = true },
-        ui.text { value = value.state_text, role = "body" },
-      } }, row("Autonomie", value.estimate_detail), row("Santé", value.health_text), row("Puissance", value.power_text),
-    }
-    if dismissible then children[#children + 1] = ui.button {
-      action_id = "dismiss-alert", accessible_label = "Dismiss battery alert",
-      content = ui.text { value = "Dismiss", role = "button" },
-    } end
-    return ui.column { gap = "normal", children = children }
+    if dismissible then
+      return ui.row { gap = "normal", children = {
+        ui.icon { name = "warning", state = value.semantic_state, size = 24 },
+        ui.column { alignment = "start", grow = 1, gap = "xsmall", children = {
+          ui.text { value = "Batterie faible · " .. value.percent_text, role = "body" },
+          ui.text { value = "Branchez votre ordinateur.", role = "muted" },
+        } },
+        ui.button { action_id = "dismiss-alert", accessible_label = "Fermer l’alerte", style = "icon", content = ui.icon { name = "close" } },
+      } }
+    end
+    return ui.column { gap = "normal", alignment = "stretch", children = {
+      ui.row { gap = "large", children = {
+        ui.progress { shape = "ring", size = 64, value = value.level, state = value.semantic_state },
+        ui.column { alignment = "start", gap = "large", children = {
+          ui.text { value = value.percent_text, role = "battery-value" },
+          ui.text { value = value.state_text, role = "muted" },
+        } },
+      } },
+      ui.spacer { size = 0 },
+      ui.divider {}, row("Autonomie", value.estimate_compact), row("Santé", value.health_text), row("Puissance", value.power_text),
+    } }
   end
 
   local function publish_alert(kind, value)
@@ -110,13 +119,14 @@ return function(api, supplied)
       context_id = context_id,
       priority = ({ plugged = 35, unplugged = 35, warning = 40, persistent = 60, critical = 90 })[kind],
       views = { compact = compact_view(value), expanded = expanded_view(value, persistent) },
+      presentation = { compact_style = "battery", expanded_style = persistent and "battery-alert" or "battery" },
     }
     if persistent then
-      spec.presentation = { reveal = "expanded" }
+      spec.presentation.reveal = "expanded"
       active_alert = context_id
     else
       spec.expires_in_ms = options.preview_duration_ms
-      if options.preview_duration_ms > 0 then spec.presentation = { reveal = "expanded", duration_ms = options.preview_duration_ms } end
+      if options.preview_duration_ms > 0 then spec.presentation.reveal, spec.presentation.duration_ms = "expanded", options.preview_duration_ms end
       active_alert = nil
     end
     api.publish(spec)
@@ -152,7 +162,7 @@ return function(api, supplied)
       value.semantic_state ~= last_snapshot.semantic_state or value.state_text ~= last_snapshot.state_text
     if immediate or not last_publish or now - last_publish >= 30 then
       api.publish { context_id = "battery", priority = 10,
-        views = { compact = compact_view(value), expanded = expanded_view(value, false) } }
+        presentation = { compact_style = "battery", expanded_style = "battery" }, views = { compact = compact_view(value), expanded = expanded_view(value, false) } }
       last_snapshot, last_publish = value, now
     end
     local alerts = observe(reading)

@@ -2,7 +2,7 @@ return {
   api = 1,
   theme = require("theme"),
   defaults = { compact = "clock", expanded = "clock" },
-  interaction = { animation_speed = 1.25, hover_exit_ms = 120, reduced_motion = false },
+  interaction = { animation_speed = 1.0, hover_exit_ms = 120, reduced_motion = false },
   modules = {
     { id = "clock", source = "modules.clock-calendar.clock_calendar", enabled = true,
       options = { week_start = "monday" } },

@@ -47,12 +47,21 @@ return function(api, supplied)
 
   local function meter(before, after)
     local icon = (after.muted or after.volume_percent == 0) and "volume-muted" or
-      (after.volume_percent <= options.maximum_percent / 2 and "volume-low" or "volume-high")
+      (after.volume_percent <= 50 and "volume-low" or "volume-high")
     return api.ui.row { gap = "normal", children = {
       api.ui.icon { name = icon, role = "hud-volume-icon", accessible_label = "Volume " .. tostring(after.volume_percent) .. " percent" },
       api.ui.progress { value = platform.clamp(after.volume_percent / options.maximum_percent, 0, 1),
         transition_from = platform.clamp(before.volume_percent / options.maximum_percent, 0, 1), state = "foreground" },
+      api.ui.text { value = tostring(after.volume_percent) .. " %", role = "muted" },
     } }
+  end
+
+  local function show(before, after)
+    if after.muted or after.volume_percent == 0 then
+      publish("audio-volume", api.ui.icon { name = "volume-muted", role = "hud-mute-icon" }, "hud-symbol")
+    else
+      publish("audio-volume", meter(before, after), "hud-meter")
+    end
   end
 
   local function change(delta)
@@ -64,7 +73,7 @@ return function(api, supplied)
     end
     local after = { volume_percent = target, muted = false }
     cached = after
-    publish("audio-volume", meter(before, after), "hud-meter")
+    show(before, after)
     return true
   end
 
@@ -77,7 +86,7 @@ return function(api, supplied)
         run({ "pactl", "set-sink-mute", "@DEFAULT_SINK@", before.muted and "0" or "1" })
         local after = { volume_percent = before.volume_percent, muted = not before.muted }
         cached = after
-        publish("audio-volume", meter(before, after), "hud-meter")
+        show(before, after)
         return true
       end,
     },

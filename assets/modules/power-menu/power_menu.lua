@@ -3,10 +3,9 @@ local platform = require("platform")
 return function(api, supplied)
   if supplied and next(supplied) ~= nil then error("power-menu has no options") end
   local choices = {
-    { id = "lock", label = "Lock", icon = "lock" },
-    { id = "sleep", label = "Sleep", icon = "sleep" },
-    { id = "reboot", label = "Reboot", icon = "reboot" },
-    { id = "power-off", label = "Power off", icon = "power-off" },
+    { id = "lock", label = "Verrouiller", icon = "lock" },
+    { id = "reboot", label = "Redémarrer", icon = "reboot" },
+    { id = "power-off", label = "Éteindre", icon = "power-off" },
   }
   local selected, confirmation, failure = 1, nil, nil
   local publish
@@ -29,49 +28,46 @@ return function(api, supplied)
     if called and result and result.timed_out then detail = "timed out" end
     if detail == "" then detail = "exited with status " .. tostring(result.status) end
     api.log("error", label .. " failed: " .. detail:sub(1, 512))
-    selected, confirmation, failure = 1, nil, "Could not " .. label:lower() .. "."
+    selected, confirmation, failure = 1, nil, "Action impossible. Réessayez."
     publish()
     return false
   end
 
-  local function title()
-    return api.ui.text { value = "Power menu", role = "body" }
-  end
-
   local function choice(id, label, icon, active)
-    local role = active and "accent" or "muted"
-    return api.ui.action_region { action_id = id, accessible_label = label,
-      content = api.ui.row { gap = "small", children = {
-        api.ui.icon { name = icon, role = role },
-        api.ui.text { value = label, role = active and "accent" or "body" },
+    return api.ui.button { action_id = id, accessible_label = label, grow = 1,
+      style = active and "session-selected" or "session",
+      content = api.ui.column { gap = "normal", children = {
+        api.ui.icon { name = icon, size = 24 },
+        api.ui.text { value = label, role = "button" },
       } } }
   end
 
   local function main_view()
-    local children = { title() }
+    local children = {}
     for index, item in ipairs(choices) do
       children[#children + 1] = choice(item.id, item.label, item.icon, index == selected)
     end
-    return api.ui.column { alignment = "start", gap = "xsmall", children = children }
+    return api.ui.row { gap = "small", children = children }
   end
 
   local function confirmation_view(kind)
-    local label, icon = kind == "reboot" and "Reboot" or "Power off",
-      kind == "reboot" and "reboot" or "power-off"
-    return api.ui.column { alignment = "start", gap = "small", children = {
-      title(),
-      api.ui.text { value = label .. "?", role = "title" },
-      api.ui.text { value = "Any unsaved work will be lost.", role = "muted" },
-      choice("cancel", "Cancel", "chevron-left", selected == 1),
-      choice("confirm-" .. kind, label, icon, selected == 2),
+    local label = kind == "reboot" and "Redémarrer" or "Éteindre"
+    return api.ui.column { gap = "normal", children = {
+      api.ui.text { value = label .. " l’ordinateur ?", role = "title" },
+      api.ui.text { value = "Les applications ouvertes seront fermées.", role = "muted" },
+      api.ui.row { gap = "normal", children = {
+        api.ui.button { action_id = "cancel", accessible_label = "Annuler", style = "quiet", focused = selected == 1,
+          content = api.ui.text { value = "Annuler", role = "button" } },
+        api.ui.button { action_id = "confirm-" .. kind, accessible_label = label, style = "danger", focused = selected == 2,
+          content = api.ui.text { value = label, role = "button" } },
+      } },
     } }
   end
 
   local function failure_view()
     return api.ui.column { alignment = "start", gap = "small", children = {
-      title(),
       api.ui.text { value = failure, role = "body" },
-      choice("back", "Back", "chevron-left", true),
+      choice("back", "Retour", "chevron-left", true),
     } }
   end
 
@@ -80,10 +76,10 @@ return function(api, supplied)
     api.publish {
       context_id = "power-menu", priority = 1000,
       views = {
-        compact = api.ui.text { value = "Power menu", role = "compact-primary" },
+        compact = api.ui.text { value = "Session", role = "compact-primary" },
         expanded = expanded,
       },
-      presentation = { expanded_style = "power-menu" },
+      presentation = { expanded_style = (confirmation or failure) and "confirmation" or "power-menu" },
     }
   end
 
@@ -111,6 +107,7 @@ return function(api, supplied)
   end
 
   local function confirmed(kind)
+    if confirmation ~= kind then return false end
     local label = kind == "reboot" and "Reboot" or "Power off"
     if run(label, { "systemctl", kind == "reboot" and "reboot" or "poweroff" }) then close() end
     return true

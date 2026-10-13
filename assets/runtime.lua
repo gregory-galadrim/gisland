@@ -170,14 +170,17 @@ function runtime.start(native, config)
   end
 
   function self.input(kind, value)
-    local record = self.forced and find_module(self.forced)
+    local context = active("expanded")
+    local record = find_module(self.forced or (context and context.owner))
     if not record or record.state ~= "running" then return false, "module does not accept input" end
     local handled
     if record.instance.input then handled = guard(record, "input " .. tostring(kind), record.instance.input, kind, value) end
     if handled == true then present() return true end
     if kind == "escape" then
       local owner = self.forced
-      for key, context in pairs(self.contexts) do if context.owner == owner then self.contexts[key] = nil end end
+      if owner then
+        for key, context in pairs(self.contexts) do if context.owner == owner and owner ~= (self.config.defaults or {}).expanded then self.contexts[key] = nil end end
+      end
       self.forced = nil
       native.overlay("collapse")
       present()
