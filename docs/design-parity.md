@@ -46,7 +46,9 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --check
 scripts/check-visual.sh
+scripts/check-transparency.sh
 bash -n scripts/install-local.sh scripts/check-visual.sh
+scripts/check-transparency.sh
 git diff --check
 ```
 
@@ -77,6 +79,11 @@ not produce covered edge pixels. The offscreen canvas is reused until it needs
 to grow; separate alpha blending preserves translucent shadows and fades.
 This costs four times the offscreen pixels plus one compositing pass. If the
 canvas cannot be allocated, drawing falls back to the direct renderer.
+
+The transparent window deliberately does not request MSAA: on the tested X11
+stack it makes the transparent background opaque. `scripts/check-transparency.sh` exercises the
+actual binary under Xvfb and Picom against a colored background, checking compact,
+expanded and collapsed states. It requires Picom, Python Pillow and Xvfb.
 
 The graphical test checks partial coverage at the selected calendar circle's
 edge, as well as opaque surfaces and visible translucent shadows. Screenshot

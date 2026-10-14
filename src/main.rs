@@ -53,11 +53,11 @@ fn run() -> Result<()> {
         watcher.watch(directory, RecursiveMode::Recursive)?;
     }
 
+    // MSAA can break X11 transparency; the renderer supplies supersampling instead.
     let mut builder = raylib::init();
     builder
         .size(472, 580)
         .title("gisland")
-        .msaa_4x()
         .undecorated()
         .always_run()
         .topmost()
