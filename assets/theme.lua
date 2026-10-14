@@ -39,7 +39,7 @@ return {
     ["day-today"] = { width = 44, height = 44, radius = 22, padding = 0, border = "muted" },
     ["day-selected"] = { width = 44, height = 44, radius = 22, padding = 0, background = "accent" },
     session = { height = 88, radius = 44, padding = 4 },
-    ["session-selected"] = { height = 88, radius = 44, padding = 4, background = "utility", border = "link" },
+    ["session-selected"] = { height = 88, radius = 44, padding = 4, background = "utility" },
   },
   view = {
     compact = { padding_horizontal = 20, padding_vertical = 8, radius = 24,

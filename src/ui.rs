@@ -479,13 +479,7 @@ impl Renderer {
             self.draw_scene(&mut clip, &scene, surface, bounds, mouse, alpha);
         }
         if let Some(hit) = self.focused_hit() {
-            clip.draw_rectangle_rounded_lines_ex(
-                hit.rectangle,
-                0.7,
-                20,
-                2.0,
-                Color::new(41, 151, 255, 255),
-            );
+            clip.draw_rectangle_rounded(hit.rectangle, 0.7, 20, Color::WHITE.alpha(0.12));
         }
     }
     fn draw_scene(
@@ -1347,13 +1341,6 @@ fn draw_node(
                 10,
                 Color::new(28, 28, 30, (255.0 * alpha) as u8),
             );
-            d.draw_rectangle_rounded_lines_ex(
-                rect,
-                0.35,
-                10,
-                1.5,
-                Color::new(41, 151, 255, (190.0 * alpha) as u8),
-            );
         }
         "button" | "action_region" => {
             let control = node.map(|n| &n["_control"]);
@@ -1375,13 +1362,7 @@ fn draw_node(
                 d.draw_rectangle_rounded_lines_ex(rect, roundness, 20, 1.0, border.alpha(alpha));
             }
             if node.is_some_and(|n| n["focused"] == true) {
-                d.draw_rectangle_rounded_lines_ex(
-                    rect,
-                    roundness,
-                    20,
-                    2.0,
-                    Color::new(41, 151, 255, 255).alpha(alpha),
-                );
+                d.draw_rectangle_rounded(rect, roundness, 20, Color::WHITE.alpha(0.12 * alpha));
             }
         }
         "divider" => d.draw_rectangle_rec(rect, color),
